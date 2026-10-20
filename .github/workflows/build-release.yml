@@ -102,6 +102,10 @@ jobs:
           if ($lines.Count -eq 0 -or -not ($lines -join '').Trim()) { $lines = @('- 首次发布') }
           $log = ($lines -join "`n")
 
+          # PowerShell 的双引号 here-string 里，反引号是转义符：
+          # 直接写 ```bat 会被吃掉两个反引号（`b 是退格符），所以用变量拼出来
+          $fence = '`' * 3
+
           $notes = @"
           ## 下载
 
@@ -140,10 +144,10 @@ jobs:
             点「更多信息 → 仍要运行」即可。想自己确认安全性，就照下面的方式用源码编译。
           - 源码就在本仓库，想自己编译：
 
-            ```bat
+            ${fence}bat
             python -m pip install pyinstaller
             python build.py
-            ```
+            ${fence}
 
           ---
 
