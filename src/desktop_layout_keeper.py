@@ -2259,6 +2259,32 @@ class TrayIcon:
             self.actions.append("quit")
 
 
+def _store_file_snapshot():
+    """自检用：记下数据文件的原始字节，跑完再写回去。
+
+    自检会真的走一遍「恢复 / 锁定 / 关窗」，难免改动 layouts.json（锁定前的自动备份、
+    选项配置的写回）。备份整份文件再覆盖回去，比去猜哪条路径写了什么可靠。
+    """
+    path = os.path.join(data_dir(), "layouts.json")
+    try:
+        with open(path, "rb") as f:
+            return path, f.read()
+    except Exception:
+        return path, None
+
+
+def _store_file_restore(saved) -> bool:
+    path, data = saved
+    if data is None:
+        return False
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> int:
     if not IS_WINDOWS:
         cli_write("本工具仅支持 Windows。\n")
@@ -3073,11 +3099,13 @@ def main() -> int:
 
 
     app = App()
+    _store_before = _store_file_snapshot()      # 自检跑完把数据文件还原回去
     if "--selftest-gui" in argv:
         # 自检：把整套界面建出来，跑几个刷新周期，然后自动关闭。
         # 用来确认 GUI 代码本身没有问题（不需要人盯着看）。
         app.after(1800, app.destroy)
         app.mainloop()
+        _store_file_restore(_store_before)
         cli_write("GUI OK\n")
         return 0
     if "--selftest-lock" in argv:
@@ -3105,6 +3133,7 @@ def main() -> int:
 
         app.after(600, _select_and_lock)
         app.mainloop()
+        _store_file_restore(_store_before)
         cli_write("LOCK BUTTON: %s\n" % result["button"])
         cli_write("LOCK LABEL: %s\n" % result["label"])
         cli_write(("LOCK OK" if result["ok"] else "LOCK FAIL") + "\n")
@@ -3168,6 +3197,7 @@ def main() -> int:
 
         app.after(800, _st1)
         app.mainloop()
+        _store_file_restore(_store_before)
 
         for key in ("answer", "lock_started", "withdrawn", "in_tray", "tray_alive", "tray_tip",
                     "lock_alive_in_tray", "visible_again", "tray_gone", "lock_alive_after",

@@ -2,9 +2,9 @@
   "product": "桌面布局管家",
   "internal_name": "DesktopLayoutKeeper",
   "kernel": "1.4.0",
-  "build": 7,
-  "updated": "2026-10-20 18:29:15",
-  "note": "自检分支输出统一走 cli_write（重定向到文件时不再是 GBK 乱码）",
+  "build": 8,
+  "updated": "2026-10-20 18:38:18",
+  "note": "自检不再留痕迹（跑完还原数据文件）+ 自检输出统一走 cli_write",
   "history": [
     {
       "v": 1,
@@ -40,6 +40,11 @@
       "v": 7,
       "time": "2026-10-20 18:29:15",
       "note": "自检分支输出统一走 cli_write（重定向到文件时不再是 GBK 乱码）"
+    },
+    {
+      "v": 8,
+      "time": "2026-10-20 18:38:18",
+      "note": "自检不再留痕迹（跑完还原数据文件）+ 自检输出统一走 cli_write"
     }
   ]
 }
