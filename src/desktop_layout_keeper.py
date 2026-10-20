@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # 桌面布局管家 (Desktop Layout Keeper) — Copyright (c) 2026 zhengwuji
 # 以 MIT 许可证发布，许可证全文见仓库根目录的 LICENSE
-"""
+r"""
 桌面布局管家 / DesktopLayoutKeeper
 ==================================
 记住 Windows 桌面图标的排列布局，一键恢复，并可长期锁定。
@@ -15,6 +15,10 @@
   * 网格整理   把图标吸附到网格（不改变顺序，只对齐）
   * 精确还原   恢复后会把坐标读回来逐项复核，并报告精确落位数量
                （本机实测 62 个图标：62/62 精确落位，布局与初始逐项一致）
+  * 适配屏幕   保存和恢复之间换了分辨率/显示器时，按比例缩放置位并夹进屏幕，
+               不会把图标写到屏幕外面去；锁定期间检测到屏幕变了会主动暂停
+  * 记录外观   快照里一并记下图标大小与排序方式，不一致时明确报出来并给出
+               一步就能照做的改法（不假装能把它们当场改回去，见「坑 3」）
   * 管理员     显示当前是否以管理员身份运行；可一键以管理员身份重启；
                可勾选「总是以管理员身份运行」，未提权时启动会主动提醒
   * 自动备份   每次恢复前自动留一份当前布局，可回退
@@ -39,6 +43,15 @@
         b. 比对前先"自校准"：让每个图标各投一票（当前坐标 - 目标坐标），
            票数集中到同一个偏移就认定是记号差异（coordinate_offset），
            票分散就认定是真漂移。因此恢复/锁定都不会被记号变化带偏。
+  3) 「图标大小」和「排序方式」不在 ListView 里，而在资源管理器自己的注册表：
+     HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop 下的 IconSize(DWORD)
+     与 Sort(20 字节)，以及 Explorer\Advanced 下的 HideIcons。
+     实测（_dev/_probe_iconsize.py）：改完之后 SHChangeNotify、WM_SETTINGCHANGE、
+     重画视图、甚至切 HideIcons 想逼 DefView 重建 —— 间距、图标矩形、IconLayouts
+     全都没动。结论是这些值只在「视图创建时」被读取（登录 / 重启资源管理器）。
+     → 所以本程序只做两件事：把保存值写回注册表（下次登录生效），以及
+       在恢复前把差异明确报出来。绝不假装"已经改回来了"，也绝不为让它生效
+       去重启 explorer（那会关掉用户所有资源管理器窗口）。
 
 依赖：仅标准库（ctypes + tkinter）。
 用法：
@@ -58,6 +71,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime
@@ -65,7 +79,7 @@ from pathlib import Path
 
 APP_NAME = "DesktopLayoutKeeper"      # 英文 id：决定数据目录名，别改
 APP_TITLE = "桌面布局管家"             # 中文名：只用于窗口标题
-APP_VERSION = "1.2.0"                 # 语义版本；exe 的 vN 由 build.py 写进 PE 资源
+APP_VERSION = "1.3.0"                 # 语义版本；exe 的 vN 由 build.py 写进 PE 资源
 IS_WINDOWS = sys.platform.startswith("win")
 from ctypes import wintypes as wt   # noqa: E402  （模块级别名，函数里也有局部同名导入）
 
@@ -299,8 +313,9 @@ if IS_WINDOWS:
     _u32 = ctypes.WinDLL("user32", use_last_error=True)
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    _adv32 = ctypes.WinDLL("advapi32", use_last_error=True)
 else:  # 仅为让模块在非 Windows 上也能被 import（运行时会拒绝启动）
-    _u32 = _k32 = _shell32 = None
+    _u32 = _k32 = _shell32 = _adv32 = None
 
 
 class _Win32:
@@ -381,6 +396,14 @@ class _Win32:
     STD_OUTPUT_HANDLE = -11
     ATTACH_PARENT_PROCESS = -1
     FILE_TYPE_CHAR = 0x0002
+
+    # ---- 注册表（桌面外观：图标大小、排序方式、是否显示桌面图标）----
+    HKEY_CURRENT_USER = 0x80000001
+    KEY_READ = 0x20019
+    KEY_WRITE = 0x20006
+    REG_DWORD = 4
+    SHELL_BAG_KEY = r"Software\Microsoft\Windows\Shell\Bags\1\Desktop"
+    EXPLORER_ADV_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
 
 
 class LVITEMW(ctypes.Structure if IS_WINDOWS else object):
@@ -868,6 +891,259 @@ def screen_text(info: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 异常：让上层能区分"没漂移"和"压根没检查成功"
+# ---------------------------------------------------------------------------
+class DesktopViewUnavailable(RuntimeError):
+    """拿不到桌面图标视图（explorer 没跑 / 权限不够 / 桌面图标被隐藏）。"""
+
+
+class DesktopScreenChanged(RuntimeError):
+    """屏幕配置和保存时不一样了，继续拿旧坐标纠偏只会反复刷桌面。"""
+
+
+def lock_error_hint(exc: BaseException) -> str:
+    """把锁定失败翻译成能直接照做的一句话。"""
+    msg = str(exc).strip() or exc.__class__.__name__
+    low = msg.lower()
+    if ("错误 5" in msg or "errno 5" in low or "拒绝访问" in msg
+            or "access is denied" in low):
+        return "%s\n→ 权限不够：右键程序 → 以管理员身份运行，再重新开启锁定。" % msg
+    if isinstance(exc, DesktopViewUnavailable) or "explorer" in low:
+        return ("%s\n→ 请确认 explorer.exe 在运行、桌面图标没被隐藏"
+                "（桌面右键 → 查看 → 显示桌面图标）。" % msg)
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# 桌面外观：图标大小 / 排序方式 / 是否显示桌面图标
+#
+# 这三项都不是 ListView 消息能改的，而是存在资源管理器自己的注册表里：
+#   HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop\IconSize  (DWORD)
+#   HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop\Sort      (20 字节)
+#   HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\HideIcons
+# 实测（_dev/_probe_iconsize.py）：写进去之后不管怎么刷新都不当场生效，
+# 只在视图创建时（登录 / 重启资源管理器）被读取。所以这里只提供"读"与
+# "写回"，是否生效由调用方如实报告，绝不谎称已经还原。
+# ---------------------------------------------------------------------------
+_adv_ready = False
+ICON_SIZE_NAMES = ((256, "超大图标"), (96, "大图标"), (48, "中等图标"), (32, "小图标"))
+
+
+def _ensure_adv_signatures() -> None:
+    global _adv_ready
+    if _adv_ready or not IS_WINDOWS:
+        return
+    _adv32.RegOpenKeyExW.restype = wt.LONG
+    _adv32.RegOpenKeyExW.argtypes = [wt.HKEY, wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                                     ctypes.POINTER(wt.HKEY)]
+    _adv32.RegQueryValueExW.restype = wt.LONG
+    _adv32.RegQueryValueExW.argtypes = [wt.HKEY, wt.LPCWSTR, ctypes.c_void_p,
+                                        ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
+                                        ctypes.POINTER(wt.DWORD)]
+    _adv32.RegSetValueExW.restype = wt.LONG
+    _adv32.RegSetValueExW.argtypes = [wt.HKEY, wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                                      ctypes.c_void_p, wt.DWORD]
+    _adv32.RegCloseKey.restype = wt.LONG
+    _adv32.RegCloseKey.argtypes = [wt.HKEY]
+    _adv_ready = True
+
+
+def _reg_open(key_path: str, mode: int):
+    """打开注册表键；打不开返回 None（普通用户也能读 HKCU，写一般也行）。"""
+    if not IS_WINDOWS:
+        return None
+    _ensure_adv_signatures()
+    handle = ctypes.c_void_p()
+    if _adv32.RegOpenKeyExW(_Win32.HKEY_CURRENT_USER, key_path, 0, mode,
+                            ctypes.byref(handle)) != 0:
+        return None
+    return handle
+
+
+def reg_read_int(key_path: str, name: str):
+    """读一个 DWORD；读不到返回 None。"""
+    handle = _reg_open(key_path, _Win32.KEY_READ)
+    if handle is None:
+        return None
+    try:
+        value = ctypes.c_uint32()
+        size = ctypes.c_uint32(4)
+        if _adv32.RegQueryValueExW(handle, name, None, None, ctypes.byref(value),
+                                   ctypes.byref(size)) != 0:
+            return None
+        return int(value.value)
+    finally:
+        _adv32.RegCloseKey(handle)
+
+
+def reg_read_bytes(key_path: str, name: str):
+    """读一个 REG_BINARY；读不到返回 None。"""
+    handle = _reg_open(key_path, _Win32.KEY_READ)
+    if handle is None:
+        return None
+    try:
+        size = ctypes.c_uint32(0)
+        if _adv32.RegQueryValueExW(handle, name, None, None, None,
+                                  ctypes.byref(size)) != 0:
+            return None
+        if not (0 < size.value <= 65536):
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if _adv32.RegQueryValueExW(handle, name, None, None, buf,
+                                  ctypes.byref(size)) != 0:
+            return None
+        return buf.raw[: size.value]
+    finally:
+        _adv32.RegCloseKey(handle)
+
+
+def reg_write_int(key_path: str, name: str, value: int) -> bool:
+    """写一个 DWORD；返回是否成功。"""
+    handle = _reg_open(key_path, _Win32.KEY_WRITE)
+    if handle is None:
+        return False
+    try:
+        v = ctypes.c_uint32(int(value))
+        return _adv32.RegSetValueExW(handle, name, 0, _Win32.REG_DWORD,
+                                     ctypes.byref(v), ctypes.sizeof(v)) == 0
+    finally:
+        _adv32.RegCloseKey(handle)
+
+
+def icon_size_name(size) -> str:
+    """把 IconSize 的像素值翻译成菜单里那一项；对不上就说像素。"""
+    if not size:
+        return "未知"
+    size = int(size)
+    near = min(ICON_SIZE_NAMES, key=lambda kv: abs(kv[0] - size))
+    if abs(near[0] - size) <= max(4, size * 0.2):
+        return "%s(%d)" % (near[1], size)
+    return "%d 像素" % size
+
+
+def desktop_appearance() -> dict:
+    """读一次桌面外观三件套；任何一项读不到就是 None，不猜。"""
+    bag = _Win32.SHELL_BAG_KEY
+    size = reg_read_int(bag, "IconSize")
+    blob = reg_read_bytes(bag, "Sort")
+    hidden = reg_read_int(_Win32.EXPLORER_ADV_KEY, "HideIcons")
+    return {
+        "icon_size": size,
+        "icon_size_name": icon_size_name(size),
+        "sort": blob.hex() if blob is not None else None,
+        "hide_icons": hidden,
+    }
+
+
+def appearance_drift(saved: dict, current: dict) -> list:
+    """比对外观三件套，返回可以直接念给用户听的差异清单。
+
+    Sort 那 20 字节的内部含义没有公开定义（本机实测全零，即默认按名称），
+    所以只判"不一样了"，不假装能解释成具体哪一种排序。
+    """
+    out = []
+    if not saved or not current:
+        return out
+    s_size, c_size = saved.get("icon_size"), current.get("icon_size")
+    if s_size and c_size and int(s_size) != int(c_size):
+        out.append("图标大小：保存时是 %s，现在是 %s。"
+                   % (icon_size_name(s_size), icon_size_name(c_size)))
+    s_sort, c_sort = saved.get("sort"), current.get("sort")
+    if s_sort and c_sort and s_sort != c_sort:
+        out.append("排序方式：和保存时不一样了（它会决定图标的先后顺序）。")
+    s_hide, c_hide = saved.get("hide_icons"), current.get("hide_icons")
+    if s_hide is not None and c_hide is not None and int(s_hide) != int(c_hide):
+        out.append("「显示桌面图标」：保存时是%s，现在是%s。"
+                   % ("关闭" if s_hide else "开启", "关闭" if c_hide else "开启"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 屏幕适配：保存和恢复之间换了显示器/分辨率时，坐标得先换算再写
+# ---------------------------------------------------------------------------
+def _virtual_rect(info: dict):
+    v = (info or {}).get("virtual") or []
+    if len(v) != 4:
+        return None
+    try:
+        x, y, w, h = (int(i) for i in v)
+    except (TypeError, ValueError):
+        return None
+    return (x, y, w, h) if w > 0 and h > 0 else None
+
+
+def screen_changed(saved: dict, current: dict) -> str:
+    """屏幕配置是否实质变了；变了返回一句人话，没变返回空串。"""
+    s, c = _virtual_rect(saved), _virtual_rect(current)
+    if s and c and s != c:
+        text = "桌面范围从 %dx%d 变成了 %dx%d" % (s[2], s[3], c[2], c[3])
+        if (s[0], s[1]) != (c[0], c[1]):
+            text += "（原点也从 (%d,%d) 变成了 (%d,%d)）" % (s[0], s[1], c[0], c[1])
+        return text
+    s_m, c_m = (saved or {}).get("monitors"), (current or {}).get("monitors")
+    if s_m and c_m and int(s_m) != int(c_m):
+        return "显示器数量从 %d 个变成了 %d 个" % (int(s_m), int(c_m))
+    return ""
+
+
+def plan_screen_fit(items: list, saved_screens: dict, current_screens: dict):
+    """把保存的坐标换算到当前屏幕，并保证不会落到屏幕外面。
+
+    返回 (新条目列表, 说明)。屏幕没变时原样返回、说明为空串。
+    测不出任一边的矩形时也不动数据（宁可不动，也不乱推）。
+    """
+    s, c = _virtual_rect(saved_screens), _virtual_rect(current_screens)
+    if not s or not c:
+        return list(items), ""
+    s_m = (saved_screens or {}).get("monitors")
+    c_m = (current_screens or {}).get("monitors")
+    same_mon = (s_m == c_m) or not s_m or not c_m
+    if s == c and same_mon:
+        return list(items), ""
+
+    sx = c[2] / float(s[2])
+    sy = c[3] / float(s[3])
+    right, bottom = c[0] + c[2] - 1, c[1] + c[3] - 1
+    out, moved, clamped = [], 0, 0
+    for it in items:
+        copy = dict(it)
+        try:
+            x, y = int(it.get("x", 0)), int(it.get("y", 0))
+        except (TypeError, ValueError):
+            out.append(copy)
+            continue
+        nx = int(round((x - s[0]) * sx + c[0]))
+        ny = int(round((y - s[1]) * sy + c[1]))
+        hit_edge = False
+        if nx < c[0]:
+            nx, hit_edge = c[0], True
+        elif nx > right:
+            nx, hit_edge = right, True
+        if ny < c[1]:
+            ny, hit_edge = c[1], True
+        elif ny > bottom:
+            ny, hit_edge = bottom, True
+        if hit_edge:
+            clamped += 1
+        if (nx, ny) != (x, y):
+            moved += 1
+        copy["x"], copy["y"] = nx, ny
+        out.append(copy)
+
+    parts = []
+    if s != c:
+        parts.append("保存时桌面 %dx%d，现在 %dx%d，已按 %.0f%%×%.0f%% 缩放置位"
+                     % (s[2], s[3], c[2], c[3], sx * 100, sy * 100))
+        if moved:
+            parts.append("换算后 %d 个图标的位置有调整" % moved)
+    if not same_mon:
+        parts.append("显示器数量由 %s 变成 %s" % (s_m, c_m))
+    if clamped:
+        parts.append("其中 %d 个原本会落到屏幕外，已拉回屏幕内" % clamped)
+    return out, "；".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # 恢复计划
 # ---------------------------------------------------------------------------
 def build_restore_plan(saved_items: list, current_items: list, index_fallback: bool = True):
@@ -1050,6 +1326,7 @@ class DesktopBackend:
                 "snap_to_grid": snap,
                 "detail": detail,
                 "screens": screen_info(),
+                "appearance": desktop_appearance(),
             }
         finally:
             self.close_views(views)
@@ -1089,6 +1366,9 @@ class DesktopBackend:
             return {
                 "views": out_views,
                 "screens": screen_info(),
+                # 图标大小 / 排序方式 / 是否显示桌面图标：都不在 ListView 里，
+                # 而是资源管理器自己的注册表，恢复时只做比对与如实报告。
+                "appearance": desktop_appearance(),
                 "captured_at": now_str(),
             }
         finally:
@@ -1126,14 +1406,18 @@ class DesktopBackend:
         saved_views = layout.get("views") or []
         views = self.open_views()
         if not views:
-            raise RuntimeError(
-                "找不到桌面图标视图。请确认 explorer.exe 正在运行，且桌面图标已显示。"
+            raise DesktopViewUnavailable(
+                "找不到桌面图标视图。请确认 explorer.exe 正在运行，且桌面图标已显示"
+                "（桌面右键 → 查看 → 显示桌面图标）。"
             )
 
         stats = {
             "restored": 0, "verified": 0, "mismatch": [], "missing": [],
             "extra": 0, "views": 0, "auto_fixed": 0, "snap_mode": [],
+            "snapped": 0, "adapted": 0, "screen_fit": [], "appearance": [],
+            "appearance_restored": [],
         }
+        current_screens = screen_info()
         try:
             if len(saved_views) == 1 and len(views) >= 1:
                 pairs = [(views[0], saved_views[0])]
@@ -1164,6 +1448,13 @@ class DesktopBackend:
 
                 current = read_view_items(view)
                 target = sv.get("items") or []
+                # 屏幕换了（改分辨率 / 接投影 / 拔掉外接屏）就先把保存的坐标按比例
+                # 换算到当前屏幕并夹进边界内，否则照抄旧数值会把图标写到屏幕外面去。
+                target, fit_note = plan_screen_fit(
+                    target, layout.get("screens") or {}, current_screens)
+                fit_applied = bool(fit_note)
+                if fit_note and fit_note not in stats["screen_fit"]:
+                    stats["screen_fit"].append(fit_note)
                 # 写之前先对齐坐标系：当前读数和"保存时"的记号未必一样
                 # （例如中途动过「对齐到网格」），直接照抄数值会整屏串位。
                 pre_off, _share = coordinate_offset(target, positions_by_name(current))
@@ -1177,14 +1468,32 @@ class DesktopBackend:
                 after_items = read_view_items(view)
                 after = positions_by_name(after_items)
                 post_off, share = coordinate_offset(target, after)
+                # 「对齐到网格」开着时，写进去的坐标会被系统吸附到最近的格点，
+                # 差半个格子以内算"吸附落位"（本机实测同一位置两种记号相差 (13,-3)），
+                # 超过半个格子才算真偏差 —— 否则会把"格子允许范围内的取整"报成失败。
+                tol_x = tol_y = 0
+                if want_snap:
+                    gap = sv.get("grid") or [0, 0]
+                    tol_x, tol_y = int(gap[0]) // 2, int(gap[1]) // 2
+
                 seen = defaultdict(int)
                 for (index, x, y, name) in plan:
                     bucket = after.get(name) or []
                     k = seen[name]
                     seen[name] += 1
                     actual = bucket[k] if k < len(bucket) else None
-                    if actual == (x + post_off[0], y + post_off[1]):
+                    want = (x + post_off[0], y + post_off[1])
+                    if actual == want:
                         stats["verified"] += 1
+                    elif fit_applied:
+                        # 屏幕变了：坐标是按比例换算过的，写进去之后还会被
+                        # 「对齐到网格」吸附到最近的格点，逐项复核没有意义
+                        #（只保证落在屏幕内）。如实算作"已适配"，不当成偏差。
+                        stats["adapted"] += 1
+                    elif (actual is not None and tol_x and tol_y
+                          and abs(actual[0] - want[0]) <= tol_x
+                          and abs(actual[1] - want[1]) <= tol_y):
+                        stats["snapped"] += 1
                     else:
                         stats["mismatch"].append((name, (x, y), actual))
 
@@ -1196,6 +1505,21 @@ class DesktopBackend:
                 stats["extra"] += len(leftover)
                 stats["missing"].extend((s.get("name") or "(无名)") for s in unmatched)
                 stats["views"] += 1
+
+            # 外观三件套（图标大小 / 排序方式 / 是否显示桌面图标）不是位置，
+            # 改不了当场生效（实测：写注册表 + SHChangeNotify + WM_SETTINGCHANGE +
+            # 重画视图 + 切 HideIcons 都不重画），所以只如实报告差异，
+            # 并把图标大小写回注册表等下次登录或重启资源管理器时生效。
+            saved_app = layout.get("appearance") or {}
+            if saved_app:
+                now_app = desktop_appearance()
+                stats["appearance"] = appearance_drift(saved_app, now_app)
+                want_size = saved_app.get("icon_size")
+                if want_size and now_app.get("icon_size") != want_size:
+                    if reg_write_int(_Win32.SHELL_BAG_KEY, "IconSize", int(want_size)):
+                        stats["appearance_restored"].append(
+                            "桌面图标大小已写回注册表：%s。这一项要下次登录或重启"
+                            "资源管理器才会看到效果。" % icon_size_name(want_size))
             return stats
         finally:
             self.close_views(views)
@@ -1204,16 +1528,28 @@ class DesktopBackend:
     def enforce(self, profile: dict, disable_auto_arrange: bool = True,
                 index_fallback: bool = True) -> list:
         """检查一次是否漂移，漂移就整体还原。返回漂移明细。"""
-        saved_views = ((profile.get("layout") or {}).get("views") or [])
+        layout = profile.get("layout") or {}
+        saved_views = layout.get("views") or []
         target = []
         for sv in saved_views:
             target.extend(sv.get("items") or [])
         if not target:
             return []
 
+        # 屏幕配置变了就**不许**再拿旧坐标纠偏：换算过的位置和保存值天然对不上，
+        # 会变成每轮都"发现漂移 → 还原 → 再发现"，把桌面按在刷新循环里出不来。
+        changed = screen_changed(layout.get("screens") or {}, screen_info())
+        if changed:
+            raise DesktopScreenChanged(
+                "%s，所以锁定期间不会用旧坐标纠偏（否则会反复刷桌面）。"
+                "请点一次「恢复选中布局」重新适配屏幕，再开锁定。" % changed)
+
         views = self.open_views()
         if not views:
-            return []
+            raise DesktopViewUnavailable(
+                "拿不到桌面图标视图：explorer.exe 可能没在运行、桌面图标被隐藏"
+                "（桌面右键 → 查看 → 显示桌面图标），或者权限不足（错误 5）。"
+            )
         try:
             # 比对前先把每个视图的「对齐到网格」拨回保存时的状态。
             # 否则坐标单位不同，会把"整体偏半格"误判成漂移，然后反复刷桌面。
@@ -1249,11 +1585,24 @@ class DesktopBackend:
 # 锁定守护线程
 # ---------------------------------------------------------------------------
 class LockWorker(threading.Thread):
-    """轮询桌面，发现图标被挪动就拉回锁定时的位置。"""
+    """轮询桌面，发现图标被挪动就拉回锁定时的位置。
+
+    一条硬规矩：**不许悄悄什么都不做**。
+    早先的实现在拿不到桌面视图时直接返回“无漂移”，界面照样显示「锁定：开」，
+    用户根本看不出锁定其实一次都没生效。现在改成：
+      * 检查失败会累计；连续 FAIL_LIMIT 次就带着原因走 on_fatal 退出，
+        界面把按钮翻回「关」并弹一次提醒；
+      * 屏幕配置变了不硬撑，报一次「已暂停」（不算失败），
+        屏幕换回来会自动恢复检查；
+      * 正常运行时每 HEARTBEAT 秒报一次心跳，用户能看出它还活着。
+    """
+
+    FAIL_LIMIT = 3
+    HEARTBEAT = 60.0
 
     def __init__(self, backend: DesktopBackend, profile: dict, interval: float,
                  on_event, disable_auto_arrange: bool = True,
-                 index_fallback: bool = True):
+                 index_fallback: bool = True, on_fatal=None, on_stop=None):
         super().__init__(daemon=True, name="DesktopLockWorker")
         self.backend = backend
         self.profile = profile
@@ -1261,15 +1610,21 @@ class LockWorker(threading.Thread):
         self.on_event = on_event
         self.disable_auto_arrange = disable_auto_arrange
         self.index_fallback = index_fallback
+        self.on_fatal = on_fatal
+        self.on_stop = on_stop
         self._stop = threading.Event()
-        self.locked = 0
-        self.failures = 0
+        self.locked = 0            # 拉回过的次数
+        self.checks = 0            # 成功检查过的次数
+        self.failures = 0          # 连续失败次数
+        self.suspended = False     # 是否因为屏幕变化而暂停
         self.last_error = ""
+        self._last_beat = time.monotonic()
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
+        fatal = ""
         self.on_event("锁定已启用：每 %.1f 秒检查一次桌面图标位置。" % self.interval)
         while not self._stop.wait(self.interval):
             try:
@@ -1277,23 +1632,50 @@ class LockWorker(threading.Thread):
                     self.profile, self.disable_auto_arrange,
                     self.index_fallback,
                 )
-                if drift:
-                    self.locked += 1
-                    sample = "，".join("%s %s→%s" % (n, a, b) for n, a, b in drift[:3])
-                    more = "" if len(drift) <= 3 else " 等 %d 处" % len(drift)
-                    self.on_event("检测到 %d 处图标被移动，已还原：%s%s"
-                                  % (len(drift), sample, more))
+            except DesktopScreenChanged as e:
+                # 这不是故障：屏幕变了就不能用旧坐标纠偏。
+                # 不累计失败次数，等屏幕换回来自动继续。
                 self.failures = 0
+                if not self.suspended:
+                    self.suspended = True
+                    self.last_error = str(e)
+                    self.on_event("锁定已暂停：%s" % e)
+                continue
             except Exception as e:
+                self.suspended = False
                 self.failures += 1
-                msg = str(e)
+                msg = lock_error_hint(e)
                 if msg != self.last_error:
                     self.last_error = msg
-                    self.on_event("锁定检查出错：%s" % msg)
-                if self.failures >= 5:
-                    self.on_event("连续 5 次失败，锁定守护自动退出。")
+                    self.on_event("锁定检查出错（连续第 %d 次）：%s" % (self.failures, msg))
+                if self.failures >= self.FAIL_LIMIT:
+                    fatal = ("连续 %d 次检查都没能执行，锁定守护已退出。"
+                             "最后一次的错误是：\n%s" % (self.failures, msg))
                     break
-        self.on_event("锁定已停止。")
+                continue
+
+            self.failures = 0
+            self.checks += 1
+            if self.suspended:
+                self.suspended = False
+                self.on_event("锁定已恢复检查：屏幕配置回到保存时的状态。")
+            if drift:
+                self.locked += 1
+                sample = "，".join("%s %s→%s" % (n, a, b) for n, a, b in drift[:3])
+                more = "" if len(drift) <= 3 else " 等 %d 处" % len(drift)
+                self.on_event("检测到 %d 处图标被移动，已还原：%s%s"
+                              % (len(drift), sample, more))
+            now = time.monotonic()
+            if now - self._last_beat >= self.HEARTBEAT:
+                self._last_beat = now
+                self.on_event("锁定运行中：已检查 %d 次，共拉回 %d 次，当前正常。"
+                              % (self.checks, self.locked))
+
+        self.on_event("锁定已停止（%s）。" % ("异常退出" if fatal else "正常结束"))
+        if fatal and self.on_fatal:
+            self.on_fatal(fatal)
+        if self.on_stop:
+            self.on_stop()
 
 
 # ---------------------------------------------------------------------------
@@ -1734,9 +2116,12 @@ def main() -> int:
                 return
             aa = info.get("auto_arrange")
             sg = info.get("snap_to_grid")
+            app = info.get("appearance") or {}
             self.lbl_status.configure(
-                text="桌面视图 %d 个  |  图标 %d 个  |  自动排列：%s  |  对齐到网格：%s  |  %s"
+                text=("桌面视图 %d 个  |  图标 %d 个  |  图标大小：%s  |  "
+                      "自动排列：%s  |  对齐到网格：%s  |  %s")
                      % (info["views"], info["icons"],
+                        app.get("icon_size_name") or "未知",
                         "未知" if aa is None else ("开" if aa else "关"),
                         "未知" if sg is None else ("开" if sg else "关"),
                         screen_text(info.get("screens") or {}))
@@ -1745,9 +2130,31 @@ def main() -> int:
         def _tick(self):
             try:
                 self.refresh_status()
+                self._refresh_lock_life()
             except Exception:
                 pass
             self.after(self.REFRESH_MS, self._tick)
+
+        def _refresh_lock_life(self):
+            """锁定中把「已检查 N 次 / 拉回 M 次」摆到标签上。
+
+            没有这个，用户根本判断不出锁定到底在干活还是已经死了
+            （以前就是这样：界面显示「开启」，实际一次都没检查成功）。
+            """
+            w = self.lock_worker
+            if w is None or not w.is_alive():
+                return
+            prof = self.store.get(self._lock_pid)
+            nm = prof.get("name") if prof else "?"
+            if getattr(w, "suspended", False):
+                self.lbl_lock.configure(
+                    text="锁定：已暂停（%s）· 屏幕配置变了" % nm,
+                    foreground="#b26a00")
+            else:
+                self.lbl_lock.configure(
+                    text="锁定：开启（%s）· 已检查 %d 次 / 拉回 %d 次"
+                         % (nm, w.checks, w.locked),
+                    foreground="#1f7a3d")
 
         # ---------------- 列表 ----------------
         def refresh_profiles(self, select_new: bool = False):
@@ -1852,12 +2259,15 @@ def main() -> int:
                     index_fallback=self.var_index_fb.get(),
                 )
             except Exception as e:
-                messagebox.showerror("恢复失败", str(e), parent=self)
-                self.log("恢复失败：%s" % e)
+                messagebox.showerror("恢复失败", lock_error_hint(e), parent=self)
+                self.log("恢复失败：%s" % lock_error_hint(e).replace("\n", " "))
                 return
 
-            msg = "已恢复 %d 个图标（%d 个视图）。\n复核结果：精确落位 %d 个，偏差 %d 个。" % (
-                stats["restored"], stats["views"], stats["verified"], len(stats["mismatch"]))
+            msg = ("已恢复 %d 个图标（%d 个视图）。\n复核结果：精确落位 %d 个"
+                   "，吸附到格点 %d 个，按屏幕适配 %d 个，偏差 %d 个。" % (
+                       stats["restored"], stats["views"], stats["verified"],
+                       stats.get("snapped", 0), stats.get("adapted", 0),
+                       len(stats["mismatch"])))
             for name, want, got in stats["mismatch"][:5]:
                 msg += "\n    · %s：期望 %s，实际 %s" % (name, want, got)
             if stats.get("missing"):
@@ -1867,12 +2277,21 @@ def main() -> int:
                 msg += "\n\n桌面另有 %d 个保存时不存在的图标，未移动。" % stats["extra"]
             if stats.get("auto_fixed"):
                 msg += "\n\n已关闭桌面的「自动排列图标」，否则写进去的位置会被系统立刻打乱。"
+            if stats.get("screen_fit"):
+                msg += "\n\n已按当前屏幕适配：%s。" % "；".join(stats["screen_fit"])
             if stats.get("snap_mode"):
                 msg += "\n%s，坐标体系与保存时一致。" % stats["snap_mode"][0]
             if stats.get("coord"):
                 msg += ("\n（读回时坐标系整体偏移 %s，属同一位置的不同记号；"
                         "已按多数票自校准后逐项比对，支持率 %.0f%%）"
                         % (stats["coord"], stats.get("coord_share", 0) * 100))
+            if stats.get("appearance_restored"):
+                msg += "\n\n" + "\n".join(stats["appearance_restored"])
+            if stats.get("appearance"):
+                msg += ("\n\n外观提醒（不在图标视图里，改不了当场生效）：\n    · "
+                        + "\n    · ".join(stats["appearance"])
+                        + "\n    → 改法：桌面右键 → 查看 → 选图标大小；"
+                          "排序方式也在右键菜单里。")
             if stats.get("note"):
                 msg += "\n\n注意：%s" % stats["note"]
 
@@ -1976,7 +2395,8 @@ def main() -> int:
                     index_fallback=self.var_index_fb.get(),
                 )
             except Exception as e:
-                messagebox.showerror("锁定失败", str(e), parent=self)
+                messagebox.showerror("锁定失败", lock_error_hint(e), parent=self)
+                self.log("锁定失败：%s" % lock_error_hint(e).replace("\n", " "))
                 return
             self.lock_worker = LockWorker(
                 self.backend, prof,
@@ -1984,6 +2404,8 @@ def main() -> int:
                 on_event=self.log_threadsafe,
                 disable_auto_arrange=self.var_disable_aa.get(),
                 index_fallback=self.var_index_fb.get(),
+                on_fatal=self._lock_fatal_threadsafe,
+                on_stop=self._lock_stopped_threadsafe,
             )
             self._lock_pid = prof["id"]
             self.lock_worker.start()
@@ -1995,6 +2417,29 @@ def main() -> int:
                 self.lock_worker = None
             self._lock_pid = None
             self._sync_lock_button()
+
+        def _lock_fatal_threadsafe(self, reason: str):
+            self.after(0, lambda r=reason: self._on_lock_fatal(r))
+
+        def _lock_stopped_threadsafe(self):
+            self.after(0, self._on_lock_stopped)
+
+        def _on_lock_stopped(self):
+            """锁定线程自己结束了（不管是正常停还是出错退出），界面得跟着回到关闭。"""
+            worker = self.lock_worker
+            if worker is not None and worker.is_alive():
+                return
+            self.lock_worker = None
+            self._lock_pid = None
+            self._sync_lock_button()
+
+        def _on_lock_fatal(self, reason: str):
+            self._on_lock_stopped()
+            self.log("锁定异常退出：%s" % reason.replace("\n", " "))
+            messagebox.showwarning(
+                "锁定已停止",
+                "%s\n\n桌面现在可以被自由拖动。修好上面的问题后，"
+                "再点一次「锁定选中布局」即可重新锁上。" % reason, parent=self)
 
         # ---------------- 提权 ----------------
         def _startup_admin_check(self):
