@@ -60,6 +60,10 @@ r"""
   桌面布局管家.exe --cli-save NAME                 保存一套布局（--overwrite 覆盖同名）
   桌面布局管家.exe --cli-restore NAME              恢复某套布局
   桌面布局管家.exe --version                       看当前是哪一版
+  桌面布局管家.exe --selftest-gui                  自检：把界面建起来跑 1.8 秒后自动退出
+  桌面布局管家.exe --selftest-lock                 自检：真点一次「锁定选中布局」，
+                                                   9 秒后读按钮旁的「已检查 N 次」再退出
+（两个 --selftest-* 是给自己验界面和锁定线程用的，退出码 0 = 通过，普通使用用不到。）
 源码运行把 exe 换成 python desktop_layout_keeper.py 即可。
 """
 

@@ -304,6 +304,8 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 ├─ 以管理员身份启动.bat    ← 提权启动（UAC）
 ├─ README.md               ← 这份说明 + 规则
 ├─ LICENSE                 ← MIT 许可证
+├─ .gitignore              ← 哪些东西不进仓库（产物 / 截图 / 临时文件）
+├─ .gitattributes          ← 换行符规则：源码 LF、.bat 强制 CRLF
 ├─ VERSION                 ← 本地版本号唯一来源：vN 编号、备注、历史
 ├─ build.py                ← 一键编译：版本 +1、烧版本号进 exe、生成 vN.exe
 ├─ src/                    ← 源码，只放 .py
@@ -321,9 +323,23 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 规矩就三条：
 
 1. **根目录不放实现代码。** 新代码写进 `src/`，新素材写进 `assets/`，新脚本进 `_dev/`。
+   根目录只允许出现：两个 `.bat`、`README.md`、`LICENSE`、`VERSION`、`build.py`、
+   `.gitignore`、`.gitattributes`，以及**最新的那个** `桌面布局管家.exe`。
 2. **版本号只在 `VERSION` 里改。** 不许在源码里手写 v3、v7 之类的编译号——
    编译号由 `build.py` 从 `VERSION` 读出 +1 再写回，永远单调递增，不可能对不上。
 3. **产物只往 `dist/` 和根目录最新 exe 写。** 其它文件都别在根目录生成。
+
+另：**这个仓库里不放任何能反推出本机环境的东西。** 具体是
+
+- 不存 exe / `build/` / `dist/`（exe 里会带编译机路径，改从 Releases 下）
+- 不存界面截图（截图会连用户名和 `%APPDATA%` 路径一起拍进去；只留
+  `assets/app_preview.png` 这张纯图标预览）
+- 源码、脚本、文档里**不写本机绝对路径**（脚本一律用
+  `os.path.dirname(os.path.abspath(__file__))` 自己定位）
+- 不存、不打印任何令牌；推送凭据由系统凭据管理器按需提供
+
+`README.md`、`LICENSE`、`.gitignore` 这些文档类改动**不会**触发编译；
+只要碰到 `src/`、`build.py`、`assets/`、`.github/` 等，CI 就会自动编译并发到 Releases。
 
 两个 `.bat` 是**纯 ASCII** 的，一个中文字符都没有：不写死中文 exe 名（用 `%~dp0*.exe`
 通配），提权时用环境变量把路径传给 PowerShell。这样不管 cmd 的控制台代码页是 936 还是
