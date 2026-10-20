@@ -19,7 +19,10 @@ Windows 上摆得好好的桌面图标，装个软件、插个 U 盘、分辨率
 ## 下载 & 安装
 
 到 **[Releases](https://github.com/zhengwuji/desk-back/releases/latest)** 下载最新的
-`桌面布局管家_v?.exe`（约 13 MB），丢到任意一个固定目录就行 —— 不用安装，卸载就是删掉它。
+`DesktopLayoutKeeper_v?.exe`（约 12 MB），丢到任意一个固定目录就行 —— 不用安装，卸载就是删掉它。
+下载后**可以随便改名**（比如改成 `桌面布局管家.exe`），不影响使用 ——
+发布包用英文名是因为 Windows 上 `gh` 上传中文文件名时会把中文整段丢掉
+（`桌面布局管家_v1.exe` 会被传成 `_v1.exe`），所以发布统一走 ASCII。
 
 > 想自己编译、或者不放心别人打包的 exe：见 [自己编译](#自己编译)。
 > 每个 Release 里都附了 SHA256，可以对一下。
@@ -124,9 +127,11 @@ python build.py -m "加了开机自启"    :: 顺带记一条备注，写进 VER
 python build.py --no-bump           :: 不 +1，原地重编译（改代码反复试的时候用）
 python build.py --clean             :: 先清 build\ 和 dist\ 再编译
 python build.py --keep-versions 5   :: 只留最近 5 个历史 exe
+python build.py --ascii-name        :: 产物叫 DesktopLayoutKeeper_vN.exe（发布用）
 ```
 
-产物落在 `dist\桌面布局管家_vN.exe`，同时覆盖一份到根目录 `桌面布局管家.exe`。
+产物落在 `dist\桌面布局管家_vN.exe`，同时覆盖一份到根目录 `桌面布局管家.exe`；
+加了 `--ascii-name` 就是 `dist\DesktopLayoutKeeper_vN.exe`（发布用）。
 
 不装 PyInstaller 也能跑：`python src\desktop_layout_keeper.py`，或者双击根目录的 `启动.bat`。
 
@@ -215,7 +220,8 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 
 ## 提交代码后自动发布
 
-推送到 `main` 就会自动：装 Python → 装 PyInstaller → `python build.py --build-number <运行序号>`
+推送到 `main` 就会自动：装 Python → 装 PyInstaller →
+`python build.py --build-number <运行序号> --ascii-name`
 → 拿这条 push 的提交信息生成**中文更新说明** → 打成 exe 发到 Releases。
 
 - 触发条件写在 `.github/workflows/build-release.yml`

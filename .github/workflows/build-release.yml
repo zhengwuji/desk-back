@@ -54,7 +54,9 @@ jobs:
           $msg = (git log -1 --pretty=%s)
           Write-Host "编译号 v$build    备注：$msg"
 
-          $out = & python build.py --build-number $build -m $msg --clean 2>&1
+          # --ascii-name：发布用的文件名必须是纯 ASCII。Windows 上 gh 传中文资产名
+          # 会把中文整段丢掉，实测「桌面布局管家_v1.exe」被上传成了「_v1.exe」。
+          $out = & python build.py --build-number $build --ascii-name -m $msg --clean 2>&1
           $code = $LASTEXITCODE
           $out | ForEach-Object { "$_" }
           if ($code -ne 0) {
@@ -96,14 +98,18 @@ jobs:
           }
 
           # 提交日志：一行一条，去掉合并提交，最多 30 条
-          $log = & git log $range --no-merges --pretty=format:'- %s（%h）' -30 2>$null
-          if (-not $log) { $log = '- 首次发布' }
+          $lines = @(& git log $range --no-merges --pretty=format:'- %s（%h）' -n 30 2>$null)
+          if ($lines.Count -eq 0 -or -not ($lines -join '').Trim()) { $lines = @('- 首次发布') }
+          $log = ($lines -join "`n")
 
           $notes = @"
           ## 下载
 
-          **[桌面布局管家_v$build.exe](https://github.com/${{ github.repository }}/releases/download/v$build/${{ steps.build.outputs.exe_name }})**
+          **[${{ steps.build.outputs.exe_name }}](https://github.com/${{ github.repository }}/releases/download/v$build/${{ steps.build.outputs.exe_name }})**
           （${{ steps.build.outputs.size }}，Windows 10/11 64 位，免安装，双击即用）
+
+          > 包名是英文的：Windows 上 gh 上传中文文件名会把中文丢掉，所以发布统一走英文名。
+          > 下载后可以随便改名，不影响使用。
 
           | 项目 | 值 |
           | --- | --- |

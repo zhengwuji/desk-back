@@ -14,15 +14,19 @@
   python build.py --no-bump          不 +1，原地重编译（改完代码反复试的时候用）
   python build.py --clean            清掉 build\\ 和 dist\\ 再编译
   python build.py --keep-versions 5  只保留最近 5 个历史版本 exe
+  python build.py --ascii-name      产物叫 DesktopLayoutKeeper_vN.exe（CI 用）
 
 GitHub Actions 用的是另一个编号来源：
 
-  python build.py --build-number 7 -m "修了 XX"
+  python build.py --build-number 7 --ascii-name -m "修了 XX"
 
 --build-number 直接指定编译号，**不读也不写 VERSION**。云端这么做的原因：CI 的编号
 来自 Actions 的运行序号（严格递增），如果还写回 VERSION，就会和本地各自涨号、互相
 覆盖、还得处理推送分叉。所以约定「本地编号看 VERSION，云端编号看 Actions 运行序号」，
 两条轨道各自单调递增，Release 页面上的 v1、v2、v3 就是云端那条。
+
+--ascii-name 是给发布用的：Windows 上 gh 把中文资产名传给 Release 时会把中文整段丢掉，
+实测「桌面布局管家_v1.exe」变成了「_v1.exe」，所以发布走 ASCII 文件名。
 
 结尾会多打一行机器可读的结果，方便 CI 取用：
 
@@ -88,12 +92,14 @@ def human(size: int) -> str:
     return "%.1f GB" % size
 
 
-def make_version_info(data: dict, build: int) -> Path:
+def make_version_info(data: dict, build: int, exe_name: str = None) -> Path:
     """生成 PyInstaller 的 --version-file 内容（PE 版本资源）。
 
     PyInstaller 会直接 eval 这个文件，所以里面的东西必须能求值：
     VSVersionInfo / FixedFileInfo / StringFileInfo / StringTable /
     StringStruct / VarFileInfo / VarStruct 都是它预先注入到作用域里的。
+
+    exe_name 要传最终的文件名，它会被写进 OriginalFilename；不传就按产品名拼。
     """
     kernel = str(data.get("kernel", "1.0.0"))
     parts = (kernel.split(".") + ["0", "0", "0"])[:3]
@@ -105,7 +111,8 @@ def make_version_info(data: dict, build: int) -> Path:
 
     product = data.get("product", "桌面布局管家")
     internal = data.get("internal_name", "DesktopLayoutKeeper")
-    exe_name = "%s_v%d.exe" % (product, build)
+    if not exe_name:
+        exe_name = "%s_v%d.exe" % (product, build)
     when = time.strftime("%Y-%m-%d %H:%M:%S")
 
     # StringTable 的键是 '<lang><codepage>' 的小写十六进制，VarStruct 里放的是十进制
@@ -163,7 +170,7 @@ def prune_versions(keep: int) -> None:
     """只保留最近 keep 个历史 exe，别让 dist 无限膨胀。"""
     if keep <= 0:
         return
-    exes = sorted(DIST.glob("桌面布局管家_v*.exe"),
+    exes = sorted(set(DIST.glob("桌面布局管家_v*.exe")) | set(DIST.glob("*_v[0-9]*.exe")),
                   key=lambda p: (p.stat().st_mtime, p.name))
     for old in exes[:-keep]:
         try:
@@ -179,6 +186,9 @@ def main() -> int:
     ap.add_argument("--no-bump", action="store_true", help="版本号不 +1，原地重编译")
     ap.add_argument("--build-number", type=int, default=None,
                     help="直接指定编译号（CI 用；不读也不写 VERSION）")
+    ap.add_argument("--ascii-name", action="store_true",
+                    help="产物用 ASCII 文件名 DesktopLayoutKeeper_vN.exe（CI 用："
+                         "gh 在 Windows 上给 Release 传中文资产名会把中文丢成 _vN.exe）")
     ap.add_argument("--clean", action="store_true", help="先删 build\\ 和 dist\\")
     ap.add_argument("--keep-versions", type=int, default=0,
                     help="只保留最近 N 个历史版本 exe（0 = 全留）")
@@ -212,25 +222,33 @@ def main() -> int:
         if args.message:
             data["note"] = args.message
     else:
-        if args.no_bump:
-            build = int(data["build"])
-        else:
-            build = int(data["build"]) + 1
+        bumped = not args.no_bump
+        build = int(data["build"]) + 1 if bumped else int(data["build"])
         data["build"] = build
         data["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if args.message:
             data["note"] = args.message
-        data["history"] = (data.get("history") or [])[-49:] + [
-            {"v": build, "time": data["updated"], "note": args.message}
-        ]
+        if bumped:
+            # --no-bump 是「同一版重编译」，不是新版本，别再往 history 里塞一条重复记录
+            data["history"] = (data.get("history") or [])[-49:] + [
+                {"v": build, "time": data["updated"], "note": args.message}
+            ]
         save_version(data)
+
+    # 最终产物叫什么：默认中文名（给人双击的），CI 用 --ascii-name 换成英文名 ——
+    # Windows 上 gh 给 Release 传中文资产名时会把中文整段丢掉（实测变成 _v1.exe），
+    # 所以发布用的名字固定走 ASCII，本地编译仍然是中文名。
+    if args.ascii_name:
+        final_name = "%s_v%d.exe" % (data.get("internal_name", "DesktopLayoutKeeper"), build)
+    else:
+        final_name = "%s_v%d.exe" % (data.get("product", "桌面布局管家"), build)
 
     log("=" * 62)
     log("  编译 %s  v%d（内核 %s）" % (data.get("product"), build, data.get("kernel")))
     log("=" * 62)
 
     ensure_icon()
-    vinfo = make_version_info(data, build)
+    vinfo = make_version_info(data, build, exe_name=final_name)
 
     DIST.mkdir(parents=True, exist_ok=True)
     internal_name = "%s_v%d" % (data.get("internal_name", "DesktopLayoutKeeper"), build)
@@ -266,20 +284,24 @@ def main() -> int:
         log("没找到产物：%s" % produced)
         return 3
 
-    final = DIST / ("%s_v%d.exe" % (data.get("product"), build))
-    if final.exists():
-        final.unlink()
-    produced.replace(final)
+    final = DIST / final_name
+    if os.path.normcase(str(final)) != os.path.normcase(str(produced)):
+        if final.exists():
+            final.unlink()
+        produced.replace(final)
 
-    # 根目录永远放一份最新的，双击就用
-    shutil.copy2(final, LATEST)
+    # 根目录永远放一份最新的，双击就用（CI 里没这个需要，别在生产工作区里留垃圾）
+    local_copy = args.build_number is None
+    if local_copy:
+        shutil.copy2(final, LATEST)
 
     digest = sha256_of(final)
     log("")
     log("编译完成：%.1f 秒" % (time.time() - t0))
     log("  版本：v%d（内核 %s）" % (build, data.get("kernel")))
     log("  产物：%s" % final)
-    log("  最新：%s" % LATEST)
+    if local_copy:
+        log("  最新：%s" % LATEST)
     log("  大小：%s" % human(final.stat().st_size))
     log("  SHA256：%s" % digest)
 
