@@ -22,6 +22,8 @@ r"""
   * 管理员     显示当前是否以管理员身份运行；可一键以管理员身份重启；
                可勾选「总是以管理员身份运行」，未提权时启动会主动提醒
   * 自动备份   每次恢复前自动留一份当前布局，可回退
+  * 托盘常驻   锁定开着的时候关窗可以缩到系统托盘，锁定继续跑；双击托盘图标回到窗口，
+              锁定一停就自动把窗口叫回来（问答细节见下面「托盘常驻的规矩」）
 
 实现说明
   桌面图标由 explorer.exe 的 SysListView32 控件承载（Progman / WorkerW → SHELLDLL_DefView）。
@@ -53,6 +55,11 @@ r"""
        在恢复前把差异明确报出来。绝不假装"已经改回来了"，也绝不为让它生效
        去重启 explorer（那会关掉用户所有资源管理器窗口）。
 
+托盘常驻的规矩（用户定的）：只有「锁定」开着的时候关窗才会问一句要不要缩到托盘；
+答「是」窗口收进托盘、锁定继续跑，双击托盘图标回到窗口；答「否」直接退出并解除锁定，
+本次运行内不再提供托盘常驻；答「取消」什么都不做。锁定一旦停止，窗口会自动从托盘叫回来
+—— 免得留下一个没有图标、看不出在干什么的托盘常驻进程。
+
 依赖：仅标准库（ctypes + tkinter）。
 用法：
   桌面布局管家.exe                                 启动 GUI（双击）
@@ -63,7 +70,10 @@ r"""
   桌面布局管家.exe --selftest-gui                  自检：把界面建起来跑 1.8 秒后自动退出
   桌面布局管家.exe --selftest-lock                 自检：真点一次「锁定选中布局」，
                                                    9 秒后读按钮旁的「已检查 N 次」再退出
-（两个 --selftest-* 是给自己验界面和锁定线程用的，退出码 0 = 通过，普通使用用不到。）
+  桌面布局管家.exe --selftest-tray                 自检：起锁定后走一次关窗流程，
+                                                   验证托盘常驻（回答由 DLK_TRAY_ANSWER
+                                                   决定：yes / no / cancel，默认 yes）
+（这三个 --selftest-* 是给自己验界面、锁定线程、托盘用的，退出码 0 = 通过，普通使用用不到。）
 源码运行把 exe 换成 python desktop_layout_keeper.py 即可。
 """
 
@@ -84,7 +94,7 @@ from pathlib import Path
 
 APP_NAME = "DesktopLayoutKeeper"      # 英文 id：决定数据目录名，别改
 APP_TITLE = "桌面布局管家"             # 中文名：只用于窗口标题
-APP_VERSION = "1.3.0"                 # 语义版本；exe 的 vN 由 build.py 写进 PE 资源
+APP_VERSION = "1.4.0"                 # 语义版本；exe 的 vN 由 build.py 写进 PE 资源
 IS_WINDOWS = sys.platform.startswith("win")
 from ctypes import wintypes as wt   # noqa: E402  （模块级别名，函数里也有局部同名导入）
 
@@ -471,6 +481,40 @@ class _Win32:
     REG_DWORD = 4
     SHELL_BAG_KEY = r"Software\Microsoft\Windows\Shell\Bags\1\Desktop"
     EXPLORER_ADV_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+
+    # ---- 系统托盘（Shell_NotifyIconW）----
+    WM_APP = 0x8000
+    WM_USER = 0x0400
+    WM_NULL = 0x0000
+    WM_COMMAND = 0x0111
+    WM_LBUTTONUP = 0x0202
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_RBUTTONUP = 0x0205
+    WM_CONTEXTMENU = 0x007B
+
+    NIM_ADD = 0x00000000
+    NIM_MODIFY = 0x00000001
+    NIM_DELETE = 0x00000002
+    NIF_MESSAGE = 0x00000001
+    NIF_ICON = 0x00000002
+    NIF_TIP = 0x00000004
+    NIF_INFO = 0x00000010
+    NIIF_INFO = 0x00000001
+    NIIF_NOSOUND = 0x00000010
+
+    MF_STRING = 0x0000
+    MF_SEPARATOR = 0x0800
+    TPM_RIGHTBUTTON = 0x0002
+    TPM_RETURNCMD = 0x0100
+
+    IMAGE_ICON = 1
+    LR_LOADFROMFILE = 0x00000010
+    LR_DEFAULTSIZE = 0x00000040
+    IDI_APPLICATION = 32512
+    PM_REMOVE = 0x0001
+    ERROR_CLASS_ALREADY_EXISTS = 1410
+
+    TRAY_CALLBACK_MSG = WM_APP + 1      # 托盘图标的回调消息
 
 
 class LVITEMW(ctypes.Structure if IS_WINDOWS else object):
@@ -1886,6 +1930,335 @@ class ProfileStore:
 # ---------------------------------------------------------------------------
 # 程序入口
 # ---------------------------------------------------------------------------
+# ==========================================================================
+# 系统托盘（窗口收起来以后锁定还得继续跑）
+# ==========================================================================
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint), ("pt", POINT), ("lPrivate", ctypes.c_uint),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    """Shell_NotifyIconW 的参数结构体。x64 下 sizeof 必须是 976，字段少一个都不行。"""
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint),
+        ("dwStateMask", ctypes.c_uint),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", ctypes.c_uint),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint),
+        ("guidItem", ctypes.c_byte * 16),
+        ("hBalloonIcon", ctypes.c_void_p),
+    ]
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+        ("hIconSm", ctypes.c_void_p),
+    ]
+
+
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+                             ctypes.c_size_t, ctypes.c_ssize_t)
+
+_tray_ready = False
+
+
+def _setup_tray_signatures() -> None:
+    """托盘用到的函数签名。第一次真建图标时才设，别拖慢启动。"""
+    global _tray_ready
+    if _tray_ready or not IS_WINDOWS:
+        return
+    from ctypes import wintypes as wt
+
+    _u32.RegisterClassExW.restype = wt.ATOM
+    _u32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+    _u32.CreateWindowExW.restype = wt.HWND
+    _u32.CreateWindowExW.argtypes = [
+        wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID,
+    ]
+    _u32.DefWindowProcW.restype = ctypes.c_ssize_t
+    _u32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    _u32.DestroyWindow.restype = wt.BOOL
+    _u32.DestroyWindow.argtypes = [wt.HWND]
+    _u32.LoadImageW.restype = wt.HANDLE
+    _u32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT,
+                                ctypes.c_int, ctypes.c_int, wt.UINT]
+    _u32.LoadIconW.restype = wt.HICON
+    _u32.LoadIconW.argtypes = [wt.HINSTANCE, wt.LPCWSTR]
+    _u32.DestroyIcon.restype = wt.BOOL
+    _u32.DestroyIcon.argtypes = [wt.HICON]
+    _u32.CreatePopupMenu.restype = wt.HMENU
+    _u32.CreatePopupMenu.argtypes = []
+    _u32.DestroyMenu.restype = wt.BOOL
+    _u32.DestroyMenu.argtypes = [wt.HMENU]
+    _u32.AppendMenuW.restype = wt.BOOL
+    _u32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+    _u32.TrackPopupMenu.restype = wt.UINT
+    _u32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, wt.HWND, ctypes.c_void_p]
+    _u32.SetForegroundWindow.restype = wt.BOOL
+    _u32.SetForegroundWindow.argtypes = [wt.HWND]
+    _u32.PostMessageW.restype = wt.BOOL
+    _u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    _u32.PeekMessageW.restype = wt.BOOL
+    _u32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT]
+    _u32.TranslateMessage.restype = wt.BOOL
+    _u32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+    _u32.DispatchMessageW.restype = ctypes.c_ssize_t
+    _u32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+    _u32.GetCursorPos.restype = wt.BOOL
+    _u32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+
+    _k32.GetModuleHandleW.restype = wt.HMODULE
+    _k32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+
+    _shell32.Shell_NotifyIconW.restype = wt.BOOL
+    _shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+    _shell32.ExtractIconW.restype = wt.HICON
+    _shell32.ExtractIconW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT]
+
+    _tray_ready = True
+
+
+class TrayIcon:
+    """系统托盘图标，纯 ctypes 实现（项目一直只用标准库，不引 pystray）。
+
+    为什么需要它：锁定是「后台盯着桌面」的活儿，窗口一关就停等于没锁。
+    关窗时如果锁定还开着，就问一句要不要缩到托盘继续跑。
+
+    线程模型：窗口和消息泵都在 Tk 主线程。WNDPROC 里**绝不碰 tkinter** ——
+    只把动作塞进 actions，交给 Tk 的定时器取出来处理，免得在嵌套派发里操作界面。
+    """
+
+    ICON_UID = 1
+    CMD_OPEN = 1001
+    CMD_CHECK = 1002
+    CMD_STOP_LOCK = 1003
+    CMD_QUIT = 1004
+
+    def __init__(self, tip: str = ""):
+        self.hwnd = 0
+        self.actions = []
+        self.error = ""
+        self._proc = None          # WNDPROC 回调必须自己留引用，否则被 GC 掉会崩
+        self._own_icon = None      # 自己 LoadImage/ExtractIcon 出来的图标要自己销毁
+        self._class = "DesktopLayoutKeeperTray_%d" % os.getpid()
+        self._tip = (tip or "")[:127]
+
+    # ------------------------------------------------------------ 建 / 拆
+    def create(self) -> bool:
+        if not IS_WINDOWS:
+            self.error = "只有 Windows 才有托盘"
+            return False
+        if self.hwnd:
+            return True
+        try:
+            _setup_tray_signatures()
+            self._proc = WNDPROC(self._wnd_proc)
+            hinst = _k32.GetModuleHandleW(None)
+
+            wc = WNDCLASSEXW()
+            wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+            wc.lpfnWndProc = ctypes.cast(self._proc, ctypes.c_void_p).value
+            wc.hInstance = hinst
+            wc.lpszClassName = self._class
+            if not _u32.RegisterClassExW(ctypes.byref(wc)):
+                err = ctypes.get_last_error()
+                if err != _Win32.ERROR_CLASS_ALREADY_EXISTS:
+                    self.error = "注册窗口类失败（错误 %d）" % err
+                    return False
+
+            # 普通顶层窗口但永不显示。不用 HWND_MESSAGE：那种窗口 SetForegroundWindow
+            # 会失败，弹出菜单点别处就不消失。
+            self.hwnd = _u32.CreateWindowExW(
+                0, self._class, "DesktopLayoutKeeperTray", 0,
+                0, 0, 0, 0, None, None, hinst, None)
+            if not self.hwnd:
+                self.error = "建隐藏窗口失败（错误 %d）" % ctypes.get_last_error()
+                return False
+
+            nid = self._nid(_Win32.NIF_MESSAGE | _Win32.NIF_ICON | _Win32.NIF_TIP)
+            nid.uCallbackMessage = _Win32.TRAY_CALLBACK_MSG
+            nid.hIcon = self._load_icon()
+            nid.szTip = self._tip
+            if not _shell32.Shell_NotifyIconW(_Win32.NIM_ADD, ctypes.byref(nid)):
+                self.error = "系统拒绝加托盘图标（错误 %d）" % ctypes.get_last_error()
+                self.destroy()
+                return False
+            return True
+        except Exception as exc:
+            # 托盘是锦上添花，坏了不能把主程序带走
+            self.error = "%s: %s" % (type(exc).__name__, exc)
+            self.destroy()
+            return False
+
+    def _nid(self, flags: int) -> NOTIFYICONDATAW:
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = self.ICON_UID
+        nid.uFlags = flags
+        return nid
+
+    def _load_icon(self):
+        """优先项目里的 .ico（源码运行时要的是它），打包版从自己 exe 里抠。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        probe = here
+        for _ in range(4):
+            cand = os.path.join(probe, "assets", "app.ico")
+            if os.path.isfile(cand):
+                h = _u32.LoadImageW(None, cand, _Win32.IMAGE_ICON, 0, 0,
+                                    _Win32.LR_LOADFROMFILE | _Win32.LR_DEFAULTSIZE)
+                if h:
+                    self._own_icon = h
+                    return h
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if is_frozen():
+            h = _shell32.ExtractIconW(None, sys.executable, 0)
+            if h and h != 1:                 # ExtractIcon 返回 1 表示"这个文件里没图标"
+                self._own_icon = h
+                return h
+        return _u32.LoadIconW(None, ctypes.c_wchar_p(_Win32.IDI_APPLICATION))
+
+    def destroy(self) -> None:
+        if self.hwnd:
+            try:
+                _shell32.Shell_NotifyIconW(_Win32.NIM_DELETE, ctypes.byref(self._nid(0)))
+            except Exception:
+                pass
+            if self._own_icon:
+                try:
+                    _u32.DestroyIcon(self._own_icon)
+                except Exception:
+                    pass
+                self._own_icon = None
+            try:
+                _u32.DestroyWindow(self.hwnd)
+            except Exception:
+                pass
+            self.hwnd = 0
+        self._proc = None
+
+    def alive(self) -> bool:
+        return bool(self.hwnd)
+
+    # ------------------------------------------------------------ 外观
+    def set_tip(self, tip: str) -> None:
+        tip = (tip or "")[:127]
+        if tip == self._tip:
+            return
+        self._tip = tip
+        if not self.hwnd:
+            return
+        try:
+            nid = self._nid(_Win32.NIF_TIP)
+            nid.szTip = tip
+            _shell32.Shell_NotifyIconW(_Win32.NIM_MODIFY, ctypes.byref(nid))
+        except Exception:
+            pass
+
+    def notify(self, title: str, text: str) -> None:
+        """右下角气泡。托盘图标已经存在时才有意义。"""
+        if not self.hwnd:
+            return
+        try:
+            nid = self._nid(_Win32.NIF_INFO)
+            nid.szInfoTitle = (title or "")[:63]
+            nid.szInfo = (text or "")[:255]
+            nid.dwInfoFlags = _Win32.NIIF_INFO | _Win32.NIIF_NOSOUND
+            _shell32.Shell_NotifyIconW(_Win32.NIM_MODIFY, ctypes.byref(nid))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 消息
+    def pump(self) -> None:
+        """把投给这个窗口的消息派发掉（Tk 的循环不一定管得着它们）。"""
+        if not self.hwnd:
+            return
+        msg = MSG()
+        while _u32.PeekMessageW(ctypes.byref(msg), self.hwnd, 0, 0, _Win32.PM_REMOVE):
+            _u32.TranslateMessage(ctypes.byref(msg))
+            _u32.DispatchMessageW(ctypes.byref(msg))
+
+    def _wnd_proc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == _Win32.TRAY_CALLBACK_MSG:
+                low = int(lparam) & 0xFFFF
+                if low in (_Win32.WM_RBUTTONUP, _Win32.WM_CONTEXTMENU):
+                    self._popup()
+                elif low in (_Win32.WM_LBUTTONUP, _Win32.WM_LBUTTONDBLCLK):
+                    self.actions.append("open")
+            elif msg == _Win32.WM_COMMAND:
+                self._run_command(int(wparam) & 0xFFFF)
+        except Exception:
+            pass
+        return _u32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _popup(self) -> None:
+        menu = _u32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            _u32.AppendMenuW(menu, _Win32.MF_STRING, self.CMD_OPEN, "打开主界面")
+            _u32.AppendMenuW(menu, _Win32.MF_STRING, self.CMD_CHECK, "立即检查一次")
+            _u32.AppendMenuW(menu, _Win32.MF_STRING, self.CMD_STOP_LOCK, "停止锁定")
+            _u32.AppendMenuW(menu, _Win32.MF_SEPARATOR, 0, None)
+            _u32.AppendMenuW(menu, _Win32.MF_STRING, self.CMD_QUIT, "退出程序")
+            pt = POINT()
+            _u32.GetCursorPos(ctypes.byref(pt))
+            _u32.SetForegroundWindow(self.hwnd)      # 不先抢前台，菜单点别处不消失
+            cmd = _u32.TrackPopupMenu(
+                menu, _Win32.TPM_RETURNCMD | _Win32.TPM_RIGHTBUTTON,
+                pt.x, pt.y, 0, self.hwnd, None)
+            _u32.PostMessageW(self.hwnd, _Win32.WM_NULL, 0, 0)
+            if cmd:
+                self._run_command(int(cmd))
+        finally:
+            _u32.DestroyMenu(menu)
+
+    def _run_command(self, cmd: int) -> None:
+        if cmd == self.CMD_OPEN:
+            self.actions.append("open")
+        elif cmd == self.CMD_CHECK:
+            self.actions.append("check")
+        elif cmd == self.CMD_STOP_LOCK:
+            self.actions.append("stop_lock")
+        elif cmd == self.CMD_QUIT:
+            self.actions.append("quit")
+
+
 def main() -> int:
     if not IS_WINDOWS:
         cli_write("本工具仅支持 Windows。\n")
@@ -1950,6 +2323,10 @@ def main() -> int:
             self.store = store
             self.lock_worker = None
             self._lock_pid = None
+            self.tray = None              # 托盘图标，只在「锁定运行中把窗口收起来」时才建
+            self.tray_allowed = True      # 关窗提示里选过「否」就不再建（本次运行内）
+            self.in_tray = False          # 窗口现在是不是收在托盘里
+            self.tray_error = ""
 
             self.title("%s  %s" % (APP_TITLE, version_text()))
             self.geometry("1060x900")
@@ -1963,6 +2340,7 @@ def main() -> int:
             self.protocol("WM_DELETE_WINDOW", self.on_close)
             self.log("数据目录：%s" % data_dir())
             self.log(self.version_line())
+            self.after(80, self._tray_pump)
             self.after(400, self._startup_admin_check)
 
         def version_line(self) -> str:
@@ -2199,7 +2577,8 @@ def main() -> int:
 
         def _tick(self):
             try:
-                self.refresh_status()
+                if not self.in_tray:      # 缩在托盘里时省掉这一轮跨进程读取
+                    self.refresh_status()
                 self._refresh_lock_life()
             except Exception:
                 pass
@@ -2225,6 +2604,7 @@ def main() -> int:
                     text="锁定：开启（%s）· 已检查 %d 次 / 拉回 %d 次"
                          % (nm, w.checks, w.locked),
                     foreground="#1f7a3d")
+            self._tray_update_tip()
 
         # ---------------- 列表 ----------------
         def refresh_profiles(self, select_new: bool = False):
@@ -2449,6 +2829,7 @@ def main() -> int:
             else:
                 self.btn_lock.configure(text="锁定选中布局")
                 self.lbl_lock.configure(text="锁定：关闭", foreground="#666")
+            self._tray_update_tip()
 
         def on_toggle_lock(self):
             if self.lock_worker is not None and self.lock_worker.is_alive():
@@ -2499,9 +2880,13 @@ def main() -> int:
             worker = self.lock_worker
             if worker is not None and worker.is_alive():
                 return
+            was_tray = self.in_tray
             self.lock_worker = None
             self._lock_pid = None
             self._sync_lock_button()
+            if was_tray:
+                # 锁定没了，常驻就没意义了：把窗口叫回来，别让用户对着一个没有图标的托盘发呆
+                self.leave_tray("锁定已停止")
 
         def _on_lock_fatal(self, reason: str):
             self._on_lock_stopped()
@@ -2543,15 +2928,149 @@ def main() -> int:
             self.destroy()
             os._exit(0)
 
+        # ---------------- 托盘 ----------------
+        def _lock_name(self) -> str:
+            prof = self.store.get(self._lock_pid)
+            return prof.get("name") if prof else "?"
+
+        def _tray_pump(self):
+            """托盘的消息泵：80ms 一次，只看自己那个隐藏窗口，开销可以忽略。
+
+            WNDPROC 只往 actions 里塞字符串，真正的动作在这里（Tk 主线程）执行。
+            """
+            try:
+                t = self.tray
+                if t is not None and t.alive():
+                    t.pump()
+                    while t.actions:
+                        self._tray_handle(t.actions.pop(0))
+            except Exception:
+                pass
+            try:
+                self.after(80, self._tray_pump)
+            except Exception:
+                pass
+
+        def _tray_handle(self, action: str):
+            if action == "open":
+                self.leave_tray("从托盘打开主界面")
+            elif action == "check":
+                self.log("托盘菜单：立即检查一次")
+                threading.Thread(target=self._tray_check_once, daemon=True).start()
+            elif action == "stop_lock":
+                self.log("托盘菜单：停止锁定")
+                self.stop_lock()
+            elif action == "quit":
+                self.log("托盘菜单：退出程序")
+                self._quit_app()
+
+        def _tray_check_once(self):
+            """托盘菜单的「立即检查一次」：跟锁定同一个比对逻辑，只是手动触发一次。"""
+            prof = self.store.get(self._lock_pid)
+            if not prof:
+                return
+            try:
+                drift = self.backend.enforce(
+                    prof,
+                    disable_auto_arrange=self.var_disable_aa.get(),
+                    index_fallback=self.var_index_fb.get(),
+                )
+            except Exception as e:
+                self.log_threadsafe("手动检查失败：%s" % lock_error_hint(e).replace("\n", " "))
+                return
+            self.log_threadsafe("手动检查完成：%s"
+                                % ("没有偏移" if not drift else "拉回 %d 处" % len(drift)))
+
+        def enter_tray(self) -> bool:
+            """把窗口收进托盘，锁定继续跑。托盘建不起来就老实留在窗口上。"""
+            if self.in_tray:
+                return True
+            if self.tray is None:
+                self.tray = TrayIcon("")
+            if not self.tray.alive() and not self.tray.create():
+                self.tray_error = self.tray.error
+                self.log("托盘不可用（%s），窗口保持打开。" % self.tray.error)
+                self.tray = None
+                return False
+            self.in_tray = True
+            self._tray_update_tip()
+            self.withdraw()
+            self.log("已缩到系统托盘：锁定继续运行。双击托盘图标可以打开主界面。")
+            self.tray.notify("桌面布局管家",
+                             "已缩到托盘，锁定继续运行。双击图标打开主界面。")
+            return True
+
+        def leave_tray(self, reason: str = ""):
+            """把窗口叫回来，并收掉托盘图标（窗口开着时不需要它）。"""
+            if self.tray is not None:
+                self.tray.destroy()
+                self.tray = None
+            if self.in_tray:
+                self.in_tray = False
+                try:
+                    self.deiconify()
+                    self.lift()
+                    self.focus_force()
+                except Exception:
+                    pass
+                self.log("已从托盘回到窗口%s。" % (("（%s）" % reason) if reason else ""))
+
+        def _tray_update_tip(self):
+            if self.tray is None or not self.tray.alive():
+                return
+            w = self.lock_worker
+            if w is not None and w.is_alive():
+                nm = self._lock_name()
+                if getattr(w, "suspended", False):
+                    tip = "桌面布局管家 · 锁定已暂停（%s）：屏幕配置变了" % nm
+                else:
+                    tip = ("桌面布局管家 · 锁定中（%s）· 已检查 %d 次 / 拉回 %d 次"
+                           % (nm, w.checks, w.locked))
+            else:
+                tip = "桌面布局管家"
+            self.tray.set_tip(tip)
+
+        def _tray_destroy(self):
+            if self.tray is not None:
+                self.tray.destroy()
+                self.tray = None
+
+        def _quit_app(self):
+            self.stop_lock()
+            self._tray_destroy()
+            self.destroy()
+
         # ---------------- 关闭 ----------------
         def on_close(self):
+            """关窗。
+
+            规矩（用户定的）：**只有在锁定开着的时候**才问要不要缩到托盘；
+            答「否」就不再做托盘常驻（本次运行内），程序直接退出、锁定随之解除。
+            """
             running = self.lock_worker is not None and self.lock_worker.is_alive()
-            if running:
-                if not messagebox.askyesno("退出", "锁定正在运行，退出会解除锁定。确定退出？",
-                                           parent=self):
+            if running and not self.in_tray and self.tray_allowed and IS_WINDOWS:
+                ans = messagebox.askyesnocancel(
+                    "关闭窗口",
+                    "锁定正在运行（布局：%s）。\n\n"
+                    "要不要把程序缩到系统托盘继续盯着桌面？\n\n"
+                    "　是　—— 窗口收起来，锁定继续跑；双击托盘图标可以再打开窗口\n"
+                    "　否　—— 直接退出，同时解除锁定；托盘常驻功能本次运行内关闭\n"
+                    "　取消 —— 什么都不做" % self._lock_name(),
+                    parent=self)
+                if ans is None:
                     return
-                self.stop_lock()
-            self.destroy()
+                if ans:
+                    if not self.enter_tray():
+                        return          # 托盘建不起来，就当用户想留着窗口
+                    return
+                self.tray_allowed = False
+                self.log("选择了退出，本次运行不再托盘常驻。")
+            elif running:
+                if not messagebox.askyesno(
+                        "退出", "锁定正在运行，退出会解除锁定。确定退出？", parent=self):
+                    return
+            self._quit_app()
+
 
     app = App()
     if "--selftest-gui" in argv:
@@ -2559,7 +3078,7 @@ def main() -> int:
         # 用来确认 GUI 代码本身没有问题（不需要人盯着看）。
         app.after(1800, app.destroy)
         app.mainloop()
-        print("GUI OK")
+        cli_write("GUI OK\n")
         return 0
     if "--selftest-lock" in argv:
         # 自检：真的点一次「锁定选中布局」，几秒后读按钮旁那行标签，
@@ -2586,10 +3105,93 @@ def main() -> int:
 
         app.after(600, _select_and_lock)
         app.mainloop()
-        print("LOCK BUTTON: %s" % result["button"])
-        print("LOCK LABEL: %s" % result["label"])
-        print("LOCK OK" if result["ok"] else "LOCK FAIL")
+        cli_write("LOCK BUTTON: %s\n" % result["button"])
+        cli_write("LOCK LABEL: %s\n" % result["label"])
+        cli_write(("LOCK OK" if result["ok"] else "LOCK FAIL") + "\n")
         return 0 if result["ok"] else 1
+    if "--selftest-tray" in argv:
+        # 自检：起锁定 → 走真实的「关窗」分支（回答由 DLK_TRAY_ANSWER 决定）→
+        # 确认托盘/锁定/窗口三者状态符合预期 → 收尾。全程无人值守。
+        #   yes    ：缩到托盘，窗口隐藏，锁定继续跑；再从托盘点「立即检查」+「打开主界面」
+        #   no     ：直接退出，锁定解除，本次运行不再托盘常驻
+        #   cancel ：什么都不做，窗口照旧，锁定照跑
+        res = {}
+        answer = os.environ.get("DLK_TRAY_ANSWER", "yes").strip().lower()
+        if answer not in ("yes", "no", "cancel"):
+            answer = "yes"
+
+        def _st1():
+            kids = app.tree.get_children()
+            if not kids:
+                res["error"] = "没有可锁定的布局"
+                app.destroy()
+                return
+            app.tree.selection_set(kids[0])
+            app.tree.focus(kids[0])
+            app.on_toggle_lock()
+            res["lock_started"] = bool(app.lock_worker and app.lock_worker.is_alive())
+            app.after(2500, _st2)
+
+        def _st2():
+            messagebox.askyesnocancel = lambda *a, **k: (
+                True if answer == "yes" else (None if answer == "cancel" else False))
+            res["answer"] = answer
+            app.on_close()
+            # on_close 可能已经销毁窗口（回答 no），所以这里只用不碰 Tk 的属性
+            res["in_tray"] = app.in_tray
+            res["tray_alive"] = bool(app.tray and app.tray.alive())
+            res["tray_allowed"] = app.tray_allowed
+            res["lock_alive_after"] = bool(app.lock_worker and app.lock_worker.is_alive())
+            if answer == "yes":
+                app.after(700, _st3)
+            elif answer == "cancel":
+                res["withdrawn"] = app.state() == "withdrawn"
+                app.after(600, app.destroy)
+            else:
+                res["withdrawn"] = "窗口已销毁"
+
+        def _st3():
+            res["withdrawn"] = app.state() == "withdrawn"
+            res["tray_tip"] = app.tray._tip if app.tray else ""
+            res["lock_alive_in_tray"] = bool(app.lock_worker and app.lock_worker.is_alive())
+            if app.tray:
+                _u32.PostMessageW(app.tray.hwnd, _Win32.WM_COMMAND, TrayIcon.CMD_CHECK, 0)
+                _u32.PostMessageW(app.tray.hwnd, _Win32.WM_COMMAND, TrayIcon.CMD_OPEN, 0)
+            app.after(700, _st4)
+
+        def _st4():
+            res["visible_again"] = app.state() != "withdrawn"
+            res["tray_gone"] = app.tray is None
+            res["lock_alive_final"] = bool(app.lock_worker and app.lock_worker.is_alive())
+            app.stop_lock()
+            app.after(700, app.destroy)
+
+        app.after(800, _st1)
+        app.mainloop()
+
+        for key in ("answer", "lock_started", "withdrawn", "in_tray", "tray_alive", "tray_tip",
+                    "lock_alive_in_tray", "visible_again", "tray_gone", "lock_alive_after",
+                    "lock_alive_final", "tray_allowed", "error"):
+            if res.get(key) is not None:
+                cli_write("  %-20s %r\n" % (key, res[key]))
+        if answer == "yes":
+            ok = bool(res.get("lock_started") and res.get("withdrawn") and res.get("in_tray")
+                      and res.get("tray_alive") and res.get("tray_tip")
+                      and res.get("lock_alive_in_tray") and res.get("visible_again")
+                      and res.get("tray_gone") and res.get("lock_alive_final"))
+            expect = "缩到托盘，锁定继续跑，再回到窗口"
+        elif answer == "cancel":
+            ok = bool(res.get("lock_started") and res.get("withdrawn") is False
+                      and res.get("in_tray") is False and res.get("tray_alive") is False
+                      and res.get("tray_allowed") is True and res.get("lock_alive_after"))
+            expect = "什么都不做：窗口照旧、锁定照跑"
+        else:
+            ok = bool(res.get("lock_started") and res.get("in_tray") is False
+                      and res.get("tray_alive") is False and res.get("tray_allowed") is False
+                      and res.get("lock_alive_after") is False)
+            expect = "直接退出：锁定解除、托盘常驻功能关闭"
+        cli_write("TRAY GUI %s（回答 %s → %s）\n" % ("OK" if ok else "FAIL", answer, expect))
+        return 0 if ok else 1
     app.mainloop()
     return 0
 
