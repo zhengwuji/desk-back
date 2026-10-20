@@ -43,6 +43,13 @@ jobs:
       - name: 装 PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
 
+      - name: 推送前敏感信息自检
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+        run: python _dev/_privacy_scan.py
+
       - name: 跑纯函数单测
         shell: pwsh
         env:
