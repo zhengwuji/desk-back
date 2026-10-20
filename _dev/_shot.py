@@ -122,10 +122,13 @@ def child_pids(root_pid: int) -> set:
     return pids
 
 
-def find_window(pids, title_contains: str = "", min_w: int = 200, min_h: int = 150):
+def find_window(pids, title_contains: str = "", min_w: int = 200, min_h: int = 150,
+                pid_only: bool = False):
     """在这些进程里找第一个「够大的、可见的、有标题的」顶层窗口。
 
     title_contains 非空时优先按标题匹配（跨进程树也能找到），否则按 pid 匹配。
+    pid_only=True 时只要 pid 对上的，标题再像也不认 —— 抓图/打码必须用这个，
+    否则上一轮残留的旧实例会把标题先匹配走，你会对 A 窗口做校验、给 B 进程打码。
     """
     if isinstance(pids, int):
         pids = {pids}
@@ -150,6 +153,8 @@ def find_window(pids, title_contains: str = "", min_w: int = 200, min_h: int = 1
         wpid = wt.DWORD(0)
         u32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
         by_pid = wpid.value in pids
+        if pid_only and not by_pid:
+            return True
         by_title = bool(title_contains) and title_contains in title
         if by_pid or by_title:
             hits.append((hwnd, title, w, h, by_pid, by_title))
@@ -160,7 +165,10 @@ def find_window(pids, title_contains: str = "", min_w: int = 200, min_h: int = 1
         return None
     # pid 对上的优先，其次是标题对上的
     hits.sort(key=lambda t: (not t[4], not t[5]))
-    return hits[0][:4]
+    win = hits[0][:4]
+    if pid_only and not hits[0][4]:
+        return None                      # 理论上来不到这里，保险一下
+    return win
 
 
 def grab(hwnd) -> tuple[int, int, bytes]:
@@ -370,6 +378,10 @@ def main() -> int:
     print("启动：%s" % " ".join(cmd))
     proc = subprocess.Popen(cmd, cwd=ROOT, env=child_env)
 
+    # 打码时只认自己启动的那棵进程树：上一轮残留的旧实例标题一模一样，
+    # 按标题先匹配到它就会出现「图是旧的、校验的是新的」这种假通过。
+    pid_only = bool(args.scrub)
+
     shot = None
     t0 = time.time()
     while time.time() - t0 < args.wait:
@@ -378,7 +390,7 @@ def main() -> int:
             print("进程提前退出了，退出码 %s" % proc.returncode)
             break
         tree = child_pids(proc.pid)
-        win = find_window(tree, args.title)
+        win = find_window(tree, args.title, pid_only=pid_only)
         if win:
             shot = win
             break
@@ -400,7 +412,12 @@ def main() -> int:
     rc = 0
     if args.scrub:
         rc = scrub_check(out, dump_path)
-    proc.kill()
+    # onefile 的 exe 会再 fork 一个子进程，只 kill 父进程会留下幽灵窗口，
+    # 下一轮抓图就抓到它 —— 所以整树杀。
+    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                   capture_output=True)
+    if proc.poll() is None:
+        proc.kill()
     return rc
 
 
