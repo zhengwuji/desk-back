@@ -128,7 +128,7 @@ Windows 上摆得好好的桌面图标，装个软件、插个 U 盘、分辨率
 - 解决「对齐到网格」换掉坐标系的坑：恢复时按保存时的开关状态回写坐标，
   再用**多数票自校准**区分"坐标系差异"和"图标真被拖走"（实测 62/62 精确落位）
 - 打包：单文件 exe，带图标（10 个尺寸）与 PE 版本信息；`--version` 可查编译号
-- 命令行：`--cli-snapshot` / `--cli-save` / `--cli-restore` / `--version`
+- 命令行：`--cli-snapshot` / `--cli-save` / `--cli-restore` / `--version` / `--selftest-gui` / `--selftest-lock`
 - CI：推送代码自动编译并发布 Release
 
 ### v2 / v3 —— 发布流程修正
@@ -209,8 +209,14 @@ python build.py --ascii-name        :: 产物叫 DesktopLayoutKeeper_vN.exe（�
 桌面布局管家.exe --cli-save NAME     :: 存一套布局（--overwrite 覆盖同名）
 桌面布局管家.exe --cli-restore NAME  :: 恢复某套布局
 桌面布局管家.exe --version           :: 看当前是哪一版
+桌面布局管家.exe --selftest-gui      :: 无人值守自检：建界面跑 1.8 秒后自动退出
+桌面布局管家.exe --selftest-lock     :: 无人值守自检：真点一次「锁定选中布局」，
+                                     :: 9 秒后读按钮旁的「已检查 N 次」再退出
 桌面布局管家.exe --help
 ```
+
+两个 `--selftest-*` 开关是给自己验界面和锁定线程用的（退出码 0 = 通过），
+普通使用用不到。
 
 适合做计划任务，比如登录时自动备份一份：`桌面布局管家.exe --cli-save 开机备份 --overwrite`。
 
@@ -353,11 +359,15 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 `src/`，可在任意目录执行）：
 
 - `_selftest.py` —— 端到端回归（会真的动你的图标，最后会还原并复位开关）
+- `_selftest_13.py` —— v1.3 新增功能的回归（锁定报错、外观记录、屏幕适配；纯函数 + 真机混合）
+- `_lock_pullback.py` —— 真机验证锁定：搬走一个图标，等锁定把它拉回原位
 - `_diag.py` —— 打坐标 / 开关 / 网格间距的诊断
+- `_probe_iconsize.py` —— 图标大小 / 排序存在哪、能不能当场生效的探针（会还原现场）
 - `_e2e_store.py` —— 走真实 `layouts.json` 的端到端
 - `_restore_desktop_state.py` —— 把桌面的「自动排列 / 对齐到网格」复位成开
 - `_write_launchers.py` —— 重新生成根目录那两个 .bat
 - `_shot.py` —— 抓窗口截图（`--attach 桌面布局管家.exe` 可抓已在运行的实例）
+- `_shot_nonadmin.py` —— 把 `is_admin()` 打桩成 False，用来看普通用户模式那根橙色横幅
 - `_check_elevation.py` —— 假 shell32 验证提权调用链，不弹 UAC
 
 > 跑自测前记得先把桌面布局存一份。

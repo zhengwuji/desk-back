@@ -2491,6 +2491,35 @@ def main() -> int:
         app.mainloop()
         print("GUI OK")
         return 0
+    if "--selftest-lock" in argv:
+        # 自检：真的点一次「锁定选中布局」，几秒后读按钮旁那行标签，
+        # 确认锁定线程真的在跑，并且在报「已检查 N 次 / 拉回 M 次」。
+        # 锁定静默失效就是靠这条断言抓出来的（见 _dev/_selftest_13.py）。
+        result = {"label": "", "button": "", "ok": False}
+
+        def _probe_lock():
+            result["label"] = app.lbl_lock.cget("text")
+            result["button"] = app.btn_lock.cget("text")
+            result["ok"] = "已检查" in result["label"]
+            app.stop_lock()
+
+        def _select_and_lock():
+            kids = app.tree.get_children()
+            if not kids:
+                app.destroy()
+                return
+            app.tree.selection_set(kids[0])
+            app.tree.focus(kids[0])
+            app.on_toggle_lock()
+            app.after(9000, _probe_lock)
+            app.after(9600, app.destroy)
+
+        app.after(600, _select_and_lock)
+        app.mainloop()
+        print("LOCK BUTTON: %s" % result["button"])
+        print("LOCK LABEL: %s" % result["label"])
+        print("LOCK OK" if result["ok"] else "LOCK FAIL")
+        return 0 if result["ok"] else 1
     app.mainloop()
     return 0
 
