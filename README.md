@@ -197,6 +197,20 @@ v1 发出去之后发现两个只在 CI 上才暴露的问题，顺手修掉了�
   这种假通过比不打码更危险。抓完也改成整树杀（`taskkill /F /T`）。
 - README 顶部那张界面图就是这么来的：`assets/screenshot.png`。
 
+### v7 — 纯函数单测进 CI
+
+以前改一句坐标换算，得靠真机回归（要点真实图标、关自动排列、还可能被安全策略拦），
+又慢又容易漏。这版把不依赖桌面状态的那部分逻辑单独钉住：
+
+- 新增 `_dev/_unit_tests.py`：**101 项断言，纯标准库、不需要管理员、不碰真实桌面，
+  几毫秒跑完**。覆盖 `coordinate_offset`（整体偏移识别，含支持率 0.6 的边界与
+  ±64px 上限）、`position_drift`、`build_restore_plan`（重名、大小写兜底、
+  按顺序兜底）、`plan_screen_fit`（等比换算、越界夹取、**一个图标只计一次**）、
+  `screen_changed`、`appearance_drift` / `icon_size_name`、以及 `redact_text`
+  （off/short/blocks 三种模式，含全角竖线终止符那个坑）。
+- CI 的发布流程里加了「跑纯函数单测」这一步，位置在编译之前 —— 断言不过就不出包、
+  不发 Release。
+
 ---
 
 ## 自己编译
@@ -211,7 +225,12 @@ python build.py --no-bump           :: 不 +1，原地重编译（改代码反�
 python build.py --clean             :: 先清 build\ 和 dist\ 再编译
 python build.py --keep-versions 5   :: 只留最近 5 个历史 exe
 python build.py --ascii-name        :: 产物叫 DesktopLayoutKeeper_vN.exe（发布用）
+python build.py --skip-tests        :: 跳过编译前的纯函数单测（不建议）
 ```
+
+`build.py` 在打包**之前**会自动跑一遍 `_dev/_unit_tests.py`（101 项断言，几毫秒），
+断言不过就直接退出、不出包 —— 实测把一条期望值改错，编译会以退出码 4 停下，
+原有 exe 一个字节都不动。CI 里也是同样一道闸门。
 
 产物落在 `dist\桌面布局管家_vN.exe`，同时覆盖一份到根目录 `桌面布局管家.exe`；
 加了 `--ascii-name` 就是 `dist\DesktopLayoutKeeper_vN.exe`（发布用）。
@@ -403,6 +422,9 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 `_dev/` 里是写这个工具时用的自测脚本，不影响正常使用（它们都自带 `sys.path` 补丁指向
 `src/`，可在任意目录执行）：
 
+- `_unit_tests.py` —— **纯函数单测，101 项断言，几毫秒跑完，不碰桌面**。
+  坐标偏移识别 / 漂移比对 / 恢复计划 / 屏幕换算与越界夹取 / 打码，全在这里钉死；
+  CI 每次编译前先跑它，不过就不发布。改坐标逻辑前先跑这个。
 - `_selftest.py` —— 端到端回归（会真的动你的图标，最后会还原并复位开关）
 - `_selftest_13.py` —— v1.3 新增功能的回归（锁定报错、外观记录、屏幕适配；纯函数 + 真机混合）
 - `_lock_pullback.py` —— 真机验证锁定：搬走一个图标，等锁定把它拉回原位

@@ -191,6 +191,8 @@ def main() -> int:
     ap.add_argument("--ascii-name", action="store_true",
                     help="产物用 ASCII 文件名 DesktopLayoutKeeper_vN.exe（CI 用："
                          "gh 在 Windows 上给 Release 传中文资产名会把中文丢成 _vN.exe）")
+    ap.add_argument("--skip-tests", action="store_true",
+                    help="跳过编译前的纯函数单测（_dev/_unit_tests.py）")
     ap.add_argument("--clean", action="store_true", help="先删 build\\ 和 dist\\")
     ap.add_argument("--keep-versions", type=int, default=0,
                     help="只保留最近 N 个历史版本 exe（0 = 全留）")
@@ -248,6 +250,21 @@ def main() -> int:
     log("=" * 62)
     log("  编译 %s  v%d（内核 %s）" % (data.get("product"), build, data.get("kernel")))
     log("=" * 62)
+
+    # 编译前先跑纯函数单测：坐标换算 / 恢复计划 / 屏幕适配 / 打码这些纯逻辑
+    # 以前只能靠真机回归，现在钉在这里，没过就不出包（CI 里另跑一遍，重复几毫秒无所谓）。
+    tests = ROOT / "_dev" / "_unit_tests.py"
+    if args.skip_tests:
+        log("跳过纯函数单测（--skip-tests）")
+    elif tests.is_file():
+        log("先跑纯函数单测：%s" % tests)
+        trc = subprocess.run([sys.executable, str(tests)], cwd=str(ROOT)).returncode
+        if trc != 0:
+            log("单测没过（退出码 %d），不编译。" % trc)
+            return 4
+        log("单测通过。")
+    else:
+        log("没找到 %s，跳过单测。" % tests)
 
     ensure_icon()
     vinfo = make_version_info(data, build, exe_name=final_name)
