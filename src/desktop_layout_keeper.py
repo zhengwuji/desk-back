@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 桌面布局管家 (Desktop Layout Keeper) — Copyright (c) 2026 zhengwuji
+# 以 MIT 许可证发布，许可证全文见仓库根目录的 LICENSE
 """
 桌面布局管家 / DesktopLayoutKeeper
 ==================================

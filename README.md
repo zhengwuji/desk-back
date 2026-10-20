@@ -5,6 +5,7 @@
 [![编译并发布](https://github.com/zhengwuji/desk-back/actions/workflows/build-release.yml/badge.svg)](https://github.com/zhengwuji/desk-back/actions/workflows/build-release.yml)
 [![最新版本](https://img.shields.io/github/v/release/zhengwuji/desk-back?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=blue)](https://github.com/zhengwuji/desk-back/releases/latest)
 [![下载量](https://img.shields.io/github/downloads/zhengwuji/desk-back/total?label=%E4%B8%8B%E8%BD%BD)](https://github.com/zhengwuji/desk-back/releases)
+[![许可证](https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF%E8%AF%81-MIT-green)](LICENSE)
 
 Windows 上摆得好好的桌面图标，装个软件、插个 U 盘、分辨率一变就被系统重排得乱七八糟。
 这个工具把当前布局存成一套命名快照，之后点一下「恢复」就精确回到原样；再点一下「锁定」，
@@ -128,6 +129,12 @@ v1 发出去之后发现两个只在 CI 上才暴露的问题，顺手修掉了�
 
 这两个版本的程序功能和 v1 完全一样，只是打包和发布流程的修正；
 要下载直接用最新版就行。
+
+### v4 — 补上授权
+
+- 加入 **MIT 许可证**（`LICENSE`）：可自由使用、修改、再分发，商业用途也行
+- `src/desktop_layout_keeper.py`、`build.py` 顶部补版权声明
+- Release 说明的「注意事项」里也标了授权
 
 ---
 
@@ -254,6 +261,7 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 ├─ 启动.bat                ← 源码方式启动（优先用 exe，没有 exe 才退回源码）
 ├─ 以管理员身份启动.bat    ← 提权启动（UAC）
 ├─ README.md               ← 这份说明 + 规则
+├─ LICENSE                 ← MIT 许可证
 ├─ VERSION                 ← 本地版本号唯一来源：vN 编号、备注、历史
 ├─ build.py                ← 一键编译：版本 +1、烧版本号进 exe、生成 vN.exe
 ├─ src/                    ← 源码，只放 .py
@@ -313,3 +321,25 @@ exe 是无控制台程序，命令行输出会自动挂到你的 cmd 窗口上�
 - `_check_elevation.py` —— 假 shell32 验证提权调用链，不弹 UAC
 
 > 跑自测前记得先把桌面布局存一份。
+
+---
+
+## 授权
+
+本项目以 **MIT 许可证**发布，全文见 [LICENSE](LICENSE)。
+
+```
+Copyright (c) 2026 zhengwuji
+```
+
+意思很直白：你可以随便用、随便改、随便打包分发，商业用途也行，
+只要在副本或衍生作品里保留上面的版权声明和这份许可证全文就行。
+
+软件按「现状」提供，不附带任何形式的担保。这个工具会向 `explorer.exe` 发窗口消息
+来读写桌面图标位置，代码全部公开可读，风险请自行评估。
+
+---
+
+<p align="center">
+  <sub>桌面布局管家 · 用心摆好你的桌面</sub>
+</p>
