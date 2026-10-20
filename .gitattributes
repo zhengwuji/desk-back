@@ -1,0 +1,16 @@
+# 统一换行符，否则 Windows / Linux 两边 checkout 会出现整文件 diff
+* text=auto eol=lf
+
+# .bat 必须 CRLF，LF 的批处理在某些 cmd 版本下会莫名其妙失败
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.ico binary
+*.exe binary
+*.png binary
+
+# 语言统计：把生成物和锁文件排除掉，别污染仓库语言占比
+dist/** linguist-generated=true
+build/** linguist-generated=true
+_dev/** linguist-vendored=false

@@ -1,0 +1,15 @@
+{
+  "product": "桌面布局管家",
+  "internal_name": "DesktopLayoutKeeper",
+  "kernel": "1.2.0",
+  "build": 1,
+  "updated": "2026-10-20 12:06:49",
+  "note": "第一版：布局快照/恢复/锁定 + GUI + 权限横幅",
+  "history": [
+    {
+      "v": 1,
+      "time": "2026-10-20 12:06:49",
+      "note": "第一版：布局快照/恢复/锁定 + GUI + 权限横幅，含 PE 版本资源与 10 尺寸图标"
+    }
+  ]
+}

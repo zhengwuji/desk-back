@@ -1,0 +1,181 @@
+name: 编译并发布
+
+# 触发规则：
+#   · 只要 push 到 main 就编译 —— 但如果这次 push 只动了 README.md / 说明文档，
+#     就跳过（改文档不需要重新打包）
+#   · 也可以在 Actions 页面手动点「Run workflow」
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - '**/*.md'
+      - '.gitignore'
+      - 'LICENSE'
+  workflow_dispatch:
+
+# 发布 Release 需要写权限；不改默认分支保护
+permissions:
+  contents: write
+
+# 同时只跑一个编译，但不中途取消 —— 取消会留下半个 Release
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 编译 exe 并发布
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 取出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 要拿完整的提交历史来生成中文更新说明
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 装 PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: 编译（编译号 = 本次运行序号）
+        id: build
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+        run: |
+          $build = "${{ github.run_number }}"
+          $msg = (git log -1 --pretty=%s)
+          Write-Host "编译号 v$build    备注：$msg"
+
+          $out = & python build.py --build-number $build -m $msg --clean 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { "$_" }
+          if ($code -ne 0) {
+            Write-Error "编译失败，退出码 $code"
+            exit $code
+          }
+
+          $line = ($out | Select-String -SimpleMatch '##BUILD-RESULT##' | Select-Object -First 1).Line
+          if (-not $line) { Write-Error "没拿到编译结果行"; exit 1 }
+          $json = ($line.Substring($line.IndexOf('##BUILD-RESULT##') + 16)).Trim() | ConvertFrom-Json
+
+          if (-not (Test-Path $json.exe)) { Write-Error "产物不存在：$($json.exe)"; exit 1 }
+          if ($json.size -lt 5MB) { Write-Error "产物太小，可能打包不完整：$($json.size)"; exit 1 }
+
+          "build=$($json.build)"            >> $env:GITHUB_OUTPUT
+          "exe=$($json.exe)"                >> $env:GITHUB_OUTPUT
+          "exe_name=$($json.exe_name)"      >> $env:GITHUB_OUTPUT
+          "sha=$($json.sha256)"             >> $env:GITHUB_OUTPUT
+          "size=$($json.size_human)"        >> $env:GITHUB_OUTPUT
+          "kernel=$($json.kernel)"          >> $env:GITHUB_OUTPUT
+
+          Write-Host "编译完成：$($json.exe_name)  $($json.size_human)  v$($json.build)"
+
+      - name: 生成中文更新说明
+        id: notes
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          $build = "${{ steps.build.outputs.build }}"
+          $prev  = (git tag --list 'v*' --sort=-v:refname | Select-Object -First 1)
+
+          if ($prev) {
+            $range = "$prev..HEAD"
+            $since = "上一版 $prev 以来的改动"
+          } else {
+            $range = "HEAD"
+            $since = "首个版本"
+          }
+
+          # 提交日志：一行一条，去掉合并提交，最多 30 条
+          $log = & git log $range --no-merges --pretty=format:'- %s（%h）' -30 2>$null
+          if (-not $log) { $log = '- 首次发布' }
+
+          $notes = @"
+          ## 下载
+
+          **[桌面布局管家_v$build.exe](https://github.com/${{ github.repository }}/releases/download/v$build/${{ steps.build.outputs.exe_name }})**
+          （${{ steps.build.outputs.size }}，Windows 10/11 64 位，免安装，双击即用）
+
+          | 项目 | 值 |
+          | --- | --- |
+          | 编译号 | v$build |
+          | 内核版本 | ${{ steps.build.outputs.kernel }} |
+          | SHA256 | ``${{ steps.build.outputs.sha }}`` |
+
+          ## 本次更新（$since）
+
+          $log
+
+          ## 怎么用
+
+          1. 下载上面的 exe，丢到任意一个固定目录（别放临时文件夹，不然清理时会被删掉）。
+          2. 双击运行。想让它能改桌面图标位置，建议**右键 → 以管理员身份运行**；
+             否则普通用户模式下顶部会出现橙色横幅提醒你（程序照样能开，只是可能读不到桌面）。
+          3. 摆好你想要的桌面图标，点 **「保存当前桌面布局」**，起个名字。
+          4. 以后桌面被搞乱了，点 **「恢复选中布局」** 一键还原；想让它一直被固定住，
+             点 **「锁定选中布局」**，之后谁把图标拖走都会自动拉回来。
+
+          ## 注意事项
+
+          - 程序只读写桌面图标的位置，不碰任何文件内容；布局数据存在
+            ``%APPDATA%\DesktopLayoutKeeper\layouts.json``，卸载就是删掉 exe 和这个文件。
+          - Windows 的「自动排列图标」开着时会自己按列重排，和本工具的还原会打架。
+            选项里的「恢复时关闭『自动排列图标』」默认是勾上的，建议保持。
+          - 这个 exe 没有代码签名，Windows SmartScreen 可能提示"未知发布者"，
+            点「更多信息 → 仍要运行」即可。想自己确认安全性，就照下面的方式用源码编译。
+          - 源码就在本仓库，想自己编译：
+
+            ```bat
+            python -m pip install pyinstaller
+            python build.py
+            ```
+
+          ---
+
+          完整说明见 [README.md](https://github.com/${{ github.repository }}#readme)。
+          "@
+
+          # 去掉行首缩进（PowerShell here-string 会带缩进）
+          $notes = ($notes -split "`n" | ForEach-Object { $_.TrimEnd() }) -join "`n"
+          $notes = $notes -replace '(?m)^\s{10}', ''
+          $notes | Set-Content -Path RELEASE_NOTES.md -Encoding utf8
+          Write-Host "---------- 更新说明 ----------"
+          Write-Host $notes
+
+      - name: 发布到 Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $build = "${{ steps.build.outputs.build }}"
+          $tag   = "v$build"
+          $exe   = "${{ steps.build.outputs.exe }}"
+
+          $exists = gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $exists) {
+            Write-Host "Release $tag 已存在（多半是重跑），改为覆盖附件"
+            gh release upload $tag $exe --clobber
+            gh release edit $tag --notes-file RELEASE_NOTES.md --title "桌面布局管家 $tag" --latest
+          } else {
+            gh release create $tag $exe `
+              --title "桌面布局管家 $tag" `
+              --notes-file RELEASE_NOTES.md `
+              --target "${{ github.sha }}" `
+              --latest
+          }
+
+      - name: 顺手上传一份构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 桌面布局管家_v${{ steps.build.outputs.build }}
+          path: ${{ steps.build.outputs.exe }}
+          retention-days: 30

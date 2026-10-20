@@ -1,0 +1,30 @@
+# ── 构建产物：由 GitHub Actions / build.py 生成，不进仓库 ─────────────
+/build/
+/dist/
+/桌面布局管家.exe
+*.spec
+
+# ── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ── 截图：会连本机的用户名和数据目录路径一起拍进去，所以不进仓库 ──────
+# assets/app_preview.png 是图标本身的预览图，没有隐私信息，保留
+/_dev/*.png
+/_dev/*.jpg
+/assets/界面截图.png
+
+# ── 编辑器 / 系统 ──────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+
+# ── 工具临时文件 ───────────────────────────────────────────────────
+.dsh-ops-update-*.lock
+*.lock
