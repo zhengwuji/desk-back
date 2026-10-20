@@ -72,6 +72,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -273,6 +274,68 @@ def cli_write(text: str) -> str:
 # ---------------------------------------------------------------------------
 # 路径与持久化位置
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 截图打码（给 README / Issue 用的界面截图不能带本机用户名与路径）
+#
+#   DLK_REDACT=blocks   整段路径换成等长纯色块 ████（最直观，一眼看出被打码了）
+#   DLK_REDACT=short    只留最后一段文件名，前面的目录用 …（好看些）
+#   其它非空值都当 short。没设 / 设成 0、off、none 就完全不改文字。
+#
+# 把打码放在「写进控件之前」这一层，而不是事后去抠像素：跨进程算控件坐标
+# 差几个像素就可能漏出半个用户名，而这里改的是文字本身，不可能漏。
+#
+#   DLK_REDACT_DUMP=<文件>   打完码的日志原文逐行追加进去（只存打码后的文字），
+#                            给 _dev/_shot.py --scrub 事后自检：确认图里不可能有残留路径。
+# ---------------------------------------------------------------------------
+REDACT_ENV = "DLK_REDACT"
+REDACT_DUMP_ENV = "DLK_REDACT_DUMP"
+
+# 盘符绝对路径（G:\a\b）或 UNC（\\server\share\…）。
+# 遇到空白、竖线（半角 | 与全角 ｜）、逗号、分号、引号、右括号就停 ——
+# 日志里字段是用「|」「｜」隔开的，不停就会把后面那段一起吃掉。
+_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\" + r")[^\s|\uff5c,;)\]}>\"']*")
+
+
+def redaction_mode() -> str:
+    """"" / "blocks" / "short"。"""
+    raw = (os.environ.get(REDACT_ENV) or "").strip().lower()
+    if raw in ("", "0", "off", "no", "false", "none"):
+        return ""
+    if raw in ("blocks", "block", "solid"):
+        return "blocks"
+    return "short"
+
+
+def redact_text(s: str) -> str:
+    """把字符串里的本机绝对路径换上。没开打码就原样返回。"""
+    mode = redaction_mode()
+    if not mode or not s:
+        return s
+
+    def _sub(m):
+        got = m.group(0)
+        if mode == "blocks":
+            return "\u25a0" * len(got)
+        tail = got.replace("/", "\\").rstrip("\\").rsplit("\\", 1)[-1]
+        return "\u2026\\" + tail if tail else "\u2026"
+
+    out = _PATH_RE.sub(_sub, s)
+    # 兜底：万一还有漏网的，一律打块 —— 宁可难看，不许泄露
+    return _PATH_RE.sub(lambda m: "\u25a0" * len(m.group(0)), out)
+
+
+def _redact_dump(line: str) -> None:
+    """打码开着且要了转储时，把「已经打过码」的日志行写出去给自检用。"""
+    path = os.environ.get(REDACT_DUMP_ENV)
+    if not path or not redaction_mode():
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line.replace("\n", " ") + "\n")
+    except Exception:
+        pass
+
+
 def data_dir() -> Path:
     base = (
         os.environ.get("APPDATA")
@@ -2084,6 +2147,8 @@ def main() -> int:
 
         # ---------------- 日志 / 状态 ----------------
         def log(self, msg: str):
+            msg = redact_text(msg)
+            _redact_dump(msg)
             ts = datetime.now().strftime("%H:%M:%S")
             self.txt_log.configure(state="normal")
             self.txt_log.insert("end", "[%s] %s\n" % (ts, msg))
@@ -2122,13 +2187,14 @@ def main() -> int:
             sg = info.get("snap_to_grid")
             app = info.get("appearance") or {}
             self.lbl_status.configure(
-                text=("桌面视图 %d 个  |  图标 %d 个  |  图标大小：%s  |  "
-                      "自动排列：%s  |  对齐到网格：%s  |  %s")
-                     % (info["views"], info["icons"],
-                        app.get("icon_size_name") or "未知",
-                        "未知" if aa is None else ("开" if aa else "关"),
-                        "未知" if sg is None else ("开" if sg else "关"),
-                        screen_text(info.get("screens") or {}))
+                text=redact_text(
+                    ("桌面视图 %d 个  |  图标 %d 个  |  图标大小：%s  |  "
+                     "自动排列：%s  |  对齐到网格：%s  |  %s")
+                    % (info["views"], info["icons"],
+                       app.get("icon_size_name") or "未知",
+                       "未知" if aa is None else ("开" if aa else "关"),
+                       "未知" if sg is None else ("开" if sg else "关"),
+                       screen_text(info.get("screens") or {})))
             )
 
         def _tick(self):

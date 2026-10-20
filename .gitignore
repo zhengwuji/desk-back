@@ -16,7 +16,10 @@ venv/
 # assets/app_preview.png 是图标本身的预览图，没有隐私信息，保留
 /_dev/*.png
 /_dev/*.jpg
-/assets/界面截图.png
+# assets 下默认不接 png，只逐个放行「确认没有隐私」的那几张
+/assets/*.png
+!/assets/screenshot.png
+!/assets/app_preview.png
 
 # ── 编辑器 / 系统 ──────────────────────────────────────────────────
 .vscode/

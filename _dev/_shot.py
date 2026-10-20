@@ -5,6 +5,12 @@
     python _dev/_shot.py --exe "桌面布局管家.exe" --out _dev/shot.png
     python _dev/_shot.py --python src/desktop_layout_keeper.py --out _dev/shot.png
     python _dev/_shot.py --pythonw _dev/_shot_nonadmin.py --out _dev/shot_nonadmin.png
+    python _dev/_shot.py --python src/desktop_layout_keeper.py --scrub short --out assets/screenshot.png
+
+--scrub 打码：给目标进程注射 DLK_REDACT，程序会把日志里的本机绝对路径
+换成纯色块（blocks）或 …（short）。抓完还会把程序自己写出的「打码后的日志」
+再扫一遍，确认没有残留路径才返回 0 —— 没通过就是这张图不能用。
+--scrub 不能跟 --attach 一起用（抓的是已经在跑的实例，没法给它注射环境变量）。
 
 它会：启动目标 → 找到该进程的主窗口 → PrintWindow 抓像素 → 存 PNG → 杀掉进程。
 不点任何按钮、不改任何设置。
@@ -15,14 +21,22 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import re
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 from ctypes import wintypes as wt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 与 src/desktop_layout_keeper.py 里的 _PATH_RE 一个意思：盘符绝对路径或 UNC。
+# 这里刻意重抄一份，不 import 主程序 —— 这个脚本要能单跑。
+REDACT_ENV = "DLK_REDACT"
+REDACT_DUMP_ENV = "DLK_REDACT_DUMP"
+_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\" + r")[^\s|\uff5c,;)\]}>\"']*")
 
 u32 = ctypes.WinDLL("user32", use_last_error=True)
 g32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -252,6 +266,40 @@ def all_pids_of(image_name: str) -> set:
     return pids
 
 
+def scrub_check(png_path: str, dump_path: str) -> int:
+    """事后自检：把目标自己写出来的「已打码日志」再扫一遍。
+
+    为什么这算数：图里的日志区是从这些文字渲染出来的，文字里没有路径，
+    像素里就不可能出现路径。返回 0 才允许这张图进仓库。
+    """
+    print()
+    print("-" * 64)
+    if not dump_path or not os.path.exists(dump_path):
+        print("SCRUB 自检：拿不到日志转储（%s）" % dump_path)
+        print("  → 没法证明没有残留路径，按失败处理，这张图别入库。")
+        return 2
+    text = open(dump_path, "r", encoding="utf-8", errors="replace").read()
+    lines = [l for l in text.splitlines() if l.strip()]
+    left = []
+    for i, l in enumerate(lines, 1):
+        for m in _PATH_RE.finditer(l):
+            left.append((i, m.group(0)))
+    print("SCRUB 自检：目标共输出 %d 行日志" % len(lines))
+    if left:
+        print("  !! 还有残留路径，这张图不能用：")
+        for i, got in left[:12]:
+            print("     :%-4d %s" % (i, got))
+        print("-" * 64)
+        return 3
+    print("  残留路径：0 处")
+    print("  日志预览（已打码）：")
+    for l in lines[:6]:
+        print("     %s" % l[:100])
+    print("  → %s 可以安全地进仓库" % os.path.basename(png_path))
+    print("-" * 64)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=False)
@@ -266,10 +314,18 @@ def main() -> int:
                     help="按标题关键字找窗口（跨进程树，默认 桌面布局管家）")
     ap.add_argument("--kill-old", action="store_true",
                     help="先杀掉同名的旧实例，避免抓到上一轮残留的窗口")
+    ap.add_argument("--scrub", nargs="?", const="blocks", default=None,
+                    choices=["blocks", "short"],
+                    help="打码后再落盘：blocks = 路径换成等长纯色块■（默认），"
+                         "short = 只留文件名（…\\xxx.exe）。抓完会自检残留路径。")
     args = ap.parse_args()
 
     if not (args.exe or args.python or args.pythonw or args.attach):
         ap.error("要给出 --exe / --python / --pythonw / --attach 之一")
+
+    if args.scrub and args.attach:
+        ap.error("--attach 抓的是已经在跑的实例，没法给它注射 DLK_REDACT；"
+                 "要打码就用 --exe / --python / --pythonw 让本脚本自己启动目标")
 
     if args.attach:
         out = args.out if os.path.isabs(args.out) else os.path.join(ROOT, args.out)
@@ -299,8 +355,20 @@ def main() -> int:
         exe = "python.exe" if args.python else "pythonw.exe"
         cmd = [exe, script]
 
+    child_env = dict(os.environ)
+    dump_path = ""
+    if args.scrub:
+        dump_path = os.path.join(tempfile.gettempdir(), "dlk_scrub_log.txt")
+        try:
+            os.remove(dump_path)
+        except OSError:
+            pass
+        child_env[REDACT_ENV] = args.scrub
+        child_env[REDACT_DUMP_ENV] = dump_path
+        print("打码：DLK_REDACT=%s（目标会把日志里的绝对路径换掉）" % args.scrub)
+
     print("启动：%s" % " ".join(cmd))
-    proc = subprocess.Popen(cmd, cwd=ROOT)
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=child_env)
 
     shot = None
     t0 = time.time()
@@ -329,8 +397,11 @@ def main() -> int:
     print("尺寸：%dx%d" % (gw, gh))
     print("截图：%s（%d 字节）" % (out, os.path.getsize(out)))
 
+    rc = 0
+    if args.scrub:
+        rc = scrub_check(out, dump_path)
     proc.kill()
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
