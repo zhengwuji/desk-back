@@ -88,7 +88,8 @@ def scan_blob(path, data, layer, hits):
 
 def collect(with_history):
     hits, files = [], []
-    tracked = [p for p in git("ls-files").split("\n") if p.strip()]
+    # core.quotepath=off：中文文件名否则会被转成八进制转义，导致 open 失败被静默跳过
+    tracked = [p for p in git("-c", "core.quotepath=off", "ls-files").split("\n") if p.strip()]
     files = tracked
     for rel in tracked:
         if os.path.normpath(rel) == os.path.normpath(SELF):
