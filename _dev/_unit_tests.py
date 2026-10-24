@@ -329,6 +329,85 @@ def test_redact():
     del os.environ[K.REDACT_ENV]
 
 
+# --------------------------------------------------------------------------
+# 8. 读不到位置 = None：假坐标绝不能流进比对
+# --------------------------------------------------------------------------
+def test_unreadable_sentinel():
+    print("读不到位置的图标：跳过比对、如实计数、绝不冒充坐标")
+    rows = [{"index": 0, "name": "A", "x": 13, "y": 2},
+            {"index": 1, "name": "B", "x": None, "y": None},
+            {"index": 2, "name": "C", "x": 13, "y": 198}]
+    pos = K.positions_by_name(rows)
+    check("None 位置不进位置表", sorted(pos), ["A", "C"])
+
+    # B 读不到 → B 不投漂移票，也不把整体偏移带歪
+    targets = items(("A", 0, 5), ("B", 0, 103), ("C", 0, 201))
+    off, _share = K.coordinate_offset(targets, pos)
+    check("B 缺席不影响偏移判定", off, (13, -3))
+    drift = K.position_drift(targets, pos, off)
+    check("读不到位置的不算漂移", drift, [])
+
+    # 保存条目位置是 null（快照时没读到）：进 unmatched，绝不进恢复计划
+    saved = [{"name": "A", "x": 0, "y": 5},
+             {"name": "B", "x": None, "y": None}]
+    plan, unmatched, leftover = K.build_restore_plan(saved, [
+        {"index": 0, "name": "A", "x": 13, "y": 2},
+        {"index": 1, "name": "B", "x": 13, "y": 100},
+    ], index_fallback=True)
+    check("null 位置不进恢复计划", [(p[3], p[1], p[2]) for p in plan], [("A", 0, 5)])
+    check("null 位置如实进 unmatched", [s["name"] for s in unmatched], ["B"])
+    check("leftover 只剩没被用上的当前图标", [c["index"] for c in leftover], [1])
+
+    # null 位置条目也不许被「按顺序兜底」拿去写
+    saved2 = [{"name": "X", "x": None, "y": None}]
+    plan2, unmatched2, _left2 = K.build_restore_plan(saved2, [
+        {"index": 0, "name": "Q", "x": 13, "y": 2},
+    ], index_fallback=True)
+    check("兜底不消费 null 位置条目", plan2, [])
+    check("兜底后 null 位置仍在 unmatched", len(unmatched2), 1)
+
+    # 屏幕适配对 null 位置原样放行（不许崩、不许编数）
+    fit, _note = K.plan_screen_fit(
+        [{"name": "B", "x": None, "y": None}],
+        {"monitors": 1, "virtual": [0, 0, 1920, 1080]},
+        {"monitors": 1, "virtual": [0, 0, 1280, 720]})
+    check("屏幕适配跳过 null 位置", fit[0]["x"] is None and fit[0]["y"] is None, True)
+
+
+# --------------------------------------------------------------------------
+# 9. 导入校验：坏结构整批拒绝，报错带条目序号
+# --------------------------------------------------------------------------
+def test_import_validation():
+    print("导入校验：轻量结构检查")
+    good = [{"name": "a", "layout": {"views": [
+        {"key": "desktop0", "items": [{"name": "A", "x": 0, "y": 5},
+                                      {"name": "B", "x": None, "y": None}]}]}}]
+    K.validate_import_payload(good)          # 不抛 = 通过（null 位置合法）
+    K.validate_import_payload([])            # 空列表合法（等于导入了 0 条）
+    try:
+        K.validate_import_payload({"profiles": []})   # dict 必须先取 profiles 才能进来
+        check("dict 直接传入应拒绝", False, True)
+    except ValueError:
+        check("dict 直接传入应拒绝", True, True)
+
+    bad_cases = [
+        ("条目不是对象", ["nope"]),
+        ("缺 layout", [{"name": "a"}]),
+        ("layout 不是对象", [{"layout": "x"}]),
+        ("views 不是列表", [{"layout": {"views": "x"}}]),
+        ("items 不是列表", [{"layout": {"views": [{"items": "x"}]}}]),
+        ("图标不是对象", [{"layout": {"views": [{"items": ["x"]}]}}]),
+        ("x 不是数字", [{"layout": {"views": [{"items": [{"name": "A", "x": "13", "y": 0}]}]}}]),
+        ("name 不是字符串", [{"layout": {"views": [{"items": [{"name": 3, "x": 0, "y": 0}]}]}}]),
+    ]
+    for label, bad in bad_cases:
+        try:
+            K.validate_import_payload(bad)
+            check("拒绝：%s" % label, False, True)
+        except ValueError:
+            check("拒绝：%s" % label, True, True)
+
+
 def main():
     print("=" * 72)
     print("桌面布局管家 · 纯函数单测（不碰真实桌面）")
@@ -336,7 +415,8 @@ def main():
     print("  内核：%s" % K.APP_VERSION)
     print("=" * 72)
     for fn in (test_coordinate_offset, test_position_drift, test_build_restore_plan,
-               test_screen_changed, test_plan_screen_fit, test_appearance, test_redact):
+               test_screen_changed, test_plan_screen_fit, test_appearance, test_redact,
+               test_unreadable_sentinel, test_import_validation):
         fn()
         print()
     print("=" * 72)

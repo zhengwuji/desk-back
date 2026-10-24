@@ -22,6 +22,9 @@ r"""
   * 管理员     显示当前是否以管理员身份运行；可一键以管理员身份重启；
                可勾选「总是以管理员身份运行」，未提权时启动会主动提醒
   * 自动备份   每次恢复前自动留一份当前布局，可回退
+  * 如实报告   读不到位置的图标 x/y 记为 null，比对时跳过并计数，
+               绝不拿假坐标冒充真实位置；锁定单轮检查有 20 秒时间预算，
+               explorer 卡顿时按失败计，不会无限拖着不报
   * 托盘常驻   锁定开着的时候关窗可以缩到系统托盘，锁定继续跑；双击托盘图标回到窗口，
               锁定一停就自动把窗口叫回来（问答细节见下面「托盘常驻的规矩」）
 
@@ -94,7 +97,7 @@ from pathlib import Path
 
 APP_NAME = "DesktopLayoutKeeper"      # 英文 id：决定数据目录名，别改
 APP_TITLE = "桌面布局管家"             # 中文名：只用于窗口标题
-APP_VERSION = "1.4.0"                 # 语义版本；exe 的 vN 由 build.py 写进 PE 资源
+APP_VERSION = "1.5.0"                 # 语义版本；exe 的 vN 由 build.py 写进 PE 资源
 IS_WINDOWS = sys.platform.startswith("win")
 from ctypes import wintypes as wt   # noqa: E402  （模块级别名，函数里也有局部同名导入）
 
@@ -837,12 +840,13 @@ def _looks_like_shell(pid: int) -> bool:
 
 
 class DesktopView:
-    __slots__ = ("hwnd", "pid", "remote")
+    __slots__ = ("hwnd", "pid", "remote", "buf")
 
     def __init__(self, hwnd, pid, remote):
         self.hwnd = hwnd
         self.pid = pid
         self.remote = remote
+        self.buf = None   # 远端共享缓冲区；只有锁定路径会缓存并跨周期复用
 
 
 # ---------------------------------------------------------------------------
@@ -905,18 +909,27 @@ def set_snap_to_grid(hwnd, enabled: bool) -> bool:
 # ---------------------------------------------------------------------------
 # 读 / 写图标
 # ---------------------------------------------------------------------------
-def read_view_items(view: DesktopView) -> list:
+def read_view_items(view: DesktopView, deadline: float = None) -> list:
     """读取一个桌面视图里的全部图标：名称 + 坐标。
 
     坐标处在「当前吸附模式」的坐标空间里：开着「对齐到网格」= 格点坐标，
     关掉 = 像素坐标。调用方必须记住读时的模式，写回前先恢复同一个模式。
+
+    读不到坐标的图标 x/y 是 None（不是 -1 之类的假坐标）：调用方必须把它
+    当成「未知」处理——跳过比对、如实计数，绝不能让它流进位置计算。
+    deadline 是 time.monotonic() 的绝对时刻，到了就抛 LockCycleTimeout，
+    给「锁定」的单轮检查兜底（explorer 卡顿时每条消息最长 3 秒，
+    没有预算的话一轮能拖几分钟，FAIL_LIMIT 就失去意义了）。
     """
     lv = view.hwnd
     count = _send(lv, _Win32.LVM_GETITEMCOUNT)
     if count <= 0:
         return []
 
-    base = view.remote.alloc(_Win32.BUF_TOTAL)
+    # buf 是随视图缓存的远端缓冲区（锁定路径跨周期复用，省掉每轮的
+    # VirtualAllocEx/VirtualFreeEx）；没有就临时借一块，用完还回去。
+    buf = getattr(view, "buf", None)
+    base = buf if buf else view.remote.alloc(_Win32.BUF_TOTAL)
     items = []
     try:
         lvitem_addr = base + _Win32.OFF_LVITEM
@@ -930,13 +943,19 @@ def read_view_items(view: DesktopView) -> list:
         item.cchTextMax = _Win32.TEXT_CHARS
 
         for i in range(count):
+            if deadline is not None and time.monotonic() > deadline:
+                raise LockCycleTimeout("单轮检查超过时间预算，本轮中止。")
+
             name = ""
             try:
                 item.iItem = i
                 view.remote.write_struct(lvitem_addr, item)
-                _send(lv, _Win32.LVM_GETITEMTEXTW, i, lvitem_addr)
-                raw = view.remote.read(text_addr, _Win32.TEXT_CHARS * 2)
-                name = raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
+                # LVM_GETITEMTEXTW 的返回值就是实际复制到的字符数：
+                # 按它定读多少字节，短名字不必把 520 字节整块读回来。
+                n = _send(lv, _Win32.LVM_GETITEMTEXTW, i, lvitem_addr)
+                if n > 0:
+                    raw = view.remote.read(text_addr, min(int(n), _Win32.TEXT_CHARS) * 2)
+                    name = raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
             except OSError:
                 name = ""
 
@@ -945,11 +964,12 @@ def read_view_items(view: DesktopView) -> list:
                 raw = view.remote.read(point_addr, 8)
                 x, y = struct.unpack("<ii", raw)
             except OSError:
-                x = y = -1
+                x = y = None      # 读不到就是未知，不许编一个坐标出来
 
-            items.append({"index": i, "name": name, "x": int(x), "y": int(y)})
+            items.append({"index": i, "name": name, "x": x, "y": y})
     finally:
-        view.remote.free(base)
+        if not buf:
+            view.remote.free(base)
     return items
 
 
@@ -959,12 +979,17 @@ def set_item_position(view: DesktopView, index: int, x: int, y: int) -> None:
         packed = (x & 0xFFFF) | ((y & 0xFFFF) << 16)
         _send(lv, _Win32.LVM_SETITEMPOSITION, index, packed)
     else:  # 超大坐标走 32 位版本，需要在目标进程里放一个 POINT
-        addr = view.remote.alloc(8)
+        buf = getattr(view, "buf", None)
+        if buf:
+            addr = buf + _Win32.OFF_POINT   # 复用视图缓存缓冲区里的 POINT 槽位
+        else:
+            addr = view.remote.alloc(8)
         try:
             view.remote.write(addr, struct.pack("<ii", x, y))
             _send(lv, _Win32.LVM_SETITEMPOSITION32, index, addr)
         finally:
-            view.remote.free(addr)
+            if not buf:
+                view.remote.free(addr)
 
 
 def refresh_view(hwnd) -> None:
@@ -1012,6 +1037,10 @@ class DesktopScreenChanged(RuntimeError):
     """屏幕配置和保存时不一样了，继续拿旧坐标纠偏只会反复刷桌面。"""
 
 
+class LockCycleTimeout(RuntimeError):
+    """单轮锁定检查超出时间预算（explorer 卡顿/消息超时叠加），本轮中止。"""
+
+
 def lock_error_hint(exc: BaseException) -> str:
     """把锁定失败翻译成能直接照做的一句话。"""
     msg = str(exc).strip() or exc.__class__.__name__
@@ -1019,6 +1048,9 @@ def lock_error_hint(exc: BaseException) -> str:
     if ("错误 5" in msg or "errno 5" in low or "拒绝访问" in msg
             or "access is denied" in low):
         return "%s\n→ 权限不够：右键程序 → 以管理员身份运行，再重新开启锁定。" % msg
+    if isinstance(exc, LockCycleTimeout):
+        return ("%s\n→ explorer 卡顿或正在重启，稍后会自动重试；"
+                "连续多次超时会自动退出锁定。" % msg)
     if isinstance(exc, DesktopViewUnavailable) or "explorer" in low:
         return ("%s\n→ 请确认 explorer.exe 在运行、桌面图标没被隐藏"
                 "（桌面右键 → 查看 → 显示桌面图标）。" % msg)
@@ -1280,6 +1312,11 @@ def build_restore_plan(saved_items: list, current_items: list, index_fallback: b
 
     for s in saved_items:
         name = (s.get("name") or "").strip()
+        if s.get("x") is None or s.get("y") is None:
+            # 保存时就没读到位置（快照里是 null）：没法恢复，也绝不让它
+            # 参与「按顺序兜底」——拿一个未知坐标去写只会写坏。
+            unmatched_saved.append(s)
+            continue
         c = None
         if name:
             c = take(lambda cur, n=name: cur["name"] == n)
@@ -1292,10 +1329,15 @@ def build_restore_plan(saved_items: list, current_items: list, index_fallback: b
             plan.append((c["index"], int(s["x"]), int(s["y"]), c["name"]))
 
     leftover = [c for c in current_items if c["index"] not in used]
-    if index_fallback and unmatched_saved and len(unmatched_saved) == len(leftover):
-        for s, c in zip(unmatched_saved, leftover):
-            plan.append((c["index"], int(s["x"]), int(s["y"]), c["name"]))
-        unmatched_saved = []
+    if index_fallback and unmatched_saved:
+        # 兜底池只收「位置读到了」的保存条目；null 位置的留在 unmatched 里如实上报
+        pool = [s for s in unmatched_saved
+                if s.get("x") is not None and s.get("y") is not None]
+        if pool and len(pool) == len(leftover):
+            for s, c in zip(pool, leftover):
+                plan.append((c["index"], int(s["x"]), int(s["y"]), c["name"]))
+            pooled = {id(s) for s in pool}
+            unmatched_saved = [s for s in unmatched_saved if id(s) not in pooled]
 
     return plan, unmatched_saved, leftover
 
@@ -1303,7 +1345,8 @@ def build_restore_plan(saved_items: list, current_items: list, index_fallback: b
 def positions_by_name(items: list) -> dict:
     out = defaultdict(list)
     for it in items:
-        if it.get("name"):
+        if (it.get("name") and it.get("x") is not None
+                and it.get("y") is not None):
             out[it["name"]].append((int(it["x"]), int(it["y"])))
     return dict(out)
 
@@ -1383,6 +1426,14 @@ def position_drift(target_items: list, current: dict, offset=(0, 0)) -> list:
 class DesktopBackend:
     """桌面布局读写。"""
 
+    ENFORCE_BUDGET_S = 20.0   # 锁定单轮检查的时间预算（秒）
+
+    def __init__(self):
+        # 锁定路径专用的视图缓存（句柄 + 远端缓冲区），跨检查周期复用。
+        # 其余路径（快照/恢复/状态刷新）仍走一次性的 open_views，互不干扰。
+        self._view_cache = None
+        self._cache_lock = threading.Lock()
+
     # ---- 视图句柄管理 ----
     def open_views(self) -> list:
         views = []
@@ -1412,6 +1463,52 @@ class DesktopBackend:
                 v.remote.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _free_bufs(views: list) -> None:
+        for v in views:
+            if getattr(v, "buf", None):
+                try:
+                    v.remote.free(v.buf)
+                except Exception:
+                    pass
+                v.buf = None
+
+    def _acquire_views(self) -> list:
+        """锁定路径专用的视图获取：句柄与远端缓冲区跨周期复用。
+
+        默认 2 秒一轮的锁定检查，每轮都重新 OpenProcess + VirtualAllocEx
+        开销不大但纯属重复，缓存起来；explorer 重启导致句柄失效时，
+        下一轮 IsWindow 复验会自动换新。
+        """
+        with self._cache_lock:
+            cached = self._view_cache
+            if cached and all(_u32.IsWindow(v.hwnd) for v in cached):
+                return cached
+            if cached:
+                self._free_bufs(cached)
+                self.close_views(cached)
+            views = self.open_views()
+            if not views:
+                self._view_cache = None
+                return []
+            for v in views:
+                try:
+                    v.buf = v.remote.alloc(_Win32.BUF_TOTAL)
+                except Exception:
+                    v.buf = None
+            self._view_cache = views
+            return views
+
+    def drop_cached_views(self) -> None:
+        """锁定结束时释放缓存（远端缓冲区 + 句柄）。"""
+        with self._cache_lock:
+            cached = self._view_cache
+            self._view_cache = None
+        if not cached:
+            return
+        self._free_bufs(cached)
+        self.close_views(cached)
 
     # ---- 查询 ----
     def describe(self) -> dict:
@@ -1512,7 +1609,12 @@ class DesktopBackend:
 
     # ---- 恢复 ----
     def restore(self, profile: dict, disable_auto_arrange: bool = True,
-                index_fallback: bool = True) -> dict:
+                index_fallback: bool = True, pre_read: dict = None) -> dict:
+        """把布局写回桌面并逐项复核。
+
+        pre_read（hwnd → 已读条目列表）允许调用方把刚刚读到的桌面数据直接
+        递进来当比对底稿（锁定纠偏路径用），省掉恢复前的整轮重读。
+        """
         layout = profile.get("layout") or {}
         saved_views = layout.get("views") or []
         views = self.open_views()
@@ -1521,12 +1623,13 @@ class DesktopBackend:
                 "找不到桌面图标视图。请确认 explorer.exe 正在运行，且桌面图标已显示"
                 "（桌面右键 → 查看 → 显示桌面图标）。"
             )
+        pre_read = pre_read or {}
 
         stats = {
             "restored": 0, "verified": 0, "mismatch": [], "missing": [],
             "extra": 0, "views": 0, "auto_fixed": 0, "snap_mode": [],
             "snapped": 0, "adapted": 0, "screen_fit": [], "appearance": [],
-            "appearance_restored": [],
+            "appearance_restored": [], "failed_reads": 0,
         }
         current_screens = screen_info()
         try:
@@ -1557,7 +1660,12 @@ class DesktopBackend:
                 stats["snap_mode"].append("对齐到网格：%s（沿用保存时）"
                                           % ("开" if want_snap else "关"))
 
-                current = read_view_items(view)
+                current = pre_read.get(view.hwnd)
+                if current is None:
+                    current = read_view_items(view)
+                # 没读到位置的图标如实计数（快照里是 null、恢复时跳过的同一批）
+                stats["failed_reads"] += sum(
+                    1 for it in current if it.get("x") is None)
                 target = sv.get("items") or []
                 # 屏幕换了（改分辨率 / 接投影 / 拔掉外接屏）就先把保存的坐标按比例
                 # 换算到当前屏幕并夹进边界内，否则照抄旧数值会把图标写到屏幕外面去。
@@ -1577,6 +1685,8 @@ class DesktopBackend:
                 # 复核：把写进去的位置再读回来。写操作本身可能让桌面切换坐标系记号，
                 # 所以这里重新算一次偏移，减掉之后必须逐项吻合。
                 after_items = read_view_items(view)
+                stats["failed_reads"] += sum(
+                    1 for it in after_items if it.get("x") is None)
                 after = positions_by_name(after_items)
                 post_off, share = coordinate_offset(target, after)
                 # 「对齐到网格」开着时，写进去的坐标会被系统吸附到最近的格点，
@@ -1637,15 +1747,24 @@ class DesktopBackend:
 
     # ---- 锁定纠偏 ----
     def enforce(self, profile: dict, disable_auto_arrange: bool = True,
-                index_fallback: bool = True) -> list:
-        """检查一次是否漂移，漂移就整体还原。返回漂移明细。"""
+                index_fallback: bool = True, budget_s: float = None) -> tuple:
+        """检查一次是否漂移，漂移就整体还原。
+
+        返回 (漂移明细, 本轮没读到位置的图标数)。第二个数是「部分读不到」
+        的如实上报：这些图标不参与比对，但也不许当成没发生过。
+        budget_s 是单轮时间预算（秒），None 用 ENFORCE_BUDGET_S——explorer
+        卡顿时每条跨进程消息最长 3 秒，没有预算一轮能拖几分钟。
+        """
         layout = profile.get("layout") or {}
         saved_views = layout.get("views") or []
         target = []
         for sv in saved_views:
-            target.extend(sv.get("items") or [])
+            for it in (sv.get("items") or []):
+                if it.get("x") is None or it.get("y") is None:
+                    continue      # 保存时就没读到位置：不参与漂移比对
+                target.append(it)
         if not target:
-            return []
+            return [], 0
 
         # 屏幕配置变了就**不许**再拿旧坐标纠偏：换算过的位置和保存值天然对不上，
         # 会变成每轮都"发现漂移 → 还原 → 再发现"，把桌面按在刷新循环里出不来。
@@ -1655,41 +1774,49 @@ class DesktopBackend:
                 "%s，所以锁定期间不会用旧坐标纠偏（否则会反复刷桌面）。"
                 "请点一次「恢复选中布局」重新适配屏幕，再开锁定。" % changed)
 
-        views = self.open_views()
+        deadline = time.monotonic() + (
+            float(budget_s) if budget_s is not None else self.ENFORCE_BUDGET_S)
+
+        views = self._acquire_views()
         if not views:
             raise DesktopViewUnavailable(
                 "拿不到桌面图标视图：explorer.exe 可能没在运行、桌面图标被隐藏"
                 "（桌面右键 → 查看 → 显示桌面图标），或者权限不足（错误 5）。"
             )
-        try:
-            # 比对前先把每个视图的「对齐到网格」拨回保存时的状态。
-            # 否则坐标单位不同，会把"整体偏半格"误判成漂移，然后反复刷桌面。
-            for i, v in enumerate(views):
-                sv = saved_views[i] if i < len(saved_views) else saved_views[0]
-                want = bool(sv.get("snap_to_grid", True))
-                try:
-                    if snap_to_grid_enabled(v.hwnd) != want:
-                        set_snap_to_grid(v.hwnd, want)
-                except OSError:
-                    pass
+        # 缓存的视图不在这里关：锁定期间跨周期复用，停锁时 drop_cached_views 统一放。
+        failed = 0
+        per_view = {}
 
-            current = defaultdict(list)
-            for v in views:
-                for it in read_view_items(v):
-                    if it["name"]:
-                        current[it["name"]].append((it["x"], it["y"]))
-            current = dict(current)
+        # 比对前先把每个视图的「对齐到网格」拨回保存时的状态。
+        # 否则坐标单位不同，会把"整体偏半格"误判成漂移，然后反复刷桌面。
+        for i, v in enumerate(views):
+            sv = saved_views[i] if i < len(saved_views) else saved_views[0]
+            want = bool(sv.get("snap_to_grid", True))
+            try:
+                if snap_to_grid_enabled(v.hwnd) != want:
+                    set_snap_to_grid(v.hwnd, want)
+            except OSError:
+                pass
 
-            # 先自校准坐标系，再比位置，否则"记号不同"会变成满屏假漂移
-            off, _share = coordinate_offset(target, current)
-            drift = position_drift(target, current, off)
-            if drift:
-                self.close_views(views)
-                views = []
-                self.restore(profile, disable_auto_arrange, index_fallback)
-            return drift
-        finally:
-            self.close_views(views)
+            items = read_view_items(v, deadline=deadline)
+            per_view[v.hwnd] = items
+            failed += sum(1 for it in items if it.get("x") is None)
+
+        current = defaultdict(list)
+        for items in per_view.values():
+            for it in items:
+                if it["name"] and it["x"] is not None:
+                    current[it["name"]].append((it["x"], it["y"]))
+        current = dict(current)
+
+        # 先自校准坐标系，再比位置，否则"记号不同"会变成满屏假漂移
+        off, _share = coordinate_offset(target, current)
+        drift = position_drift(target, current, off)
+        if drift:
+            # 刚读到的数据直接递给 restore 当比对底稿，省掉恢复前的整轮重读
+            self.restore(profile, disable_auto_arrange, index_fallback,
+                         pre_read=per_view)
+        return drift, failed
 
 
 # ---------------------------------------------------------------------------
@@ -1739,7 +1866,7 @@ class LockWorker(threading.Thread):
         self.on_event("锁定已启用：每 %.1f 秒检查一次桌面图标位置。" % self.interval)
         while not self._stop.wait(self.interval):
             try:
-                drift = self.backend.enforce(
+                drift, failed = self.backend.enforce(
                     self.profile, self.disable_auto_arrange,
                     self.index_fallback,
                 )
@@ -1765,11 +1892,27 @@ class LockWorker(threading.Thread):
                     break
                 continue
 
-            self.failures = 0
             self.checks += 1
             if self.suspended:
                 self.suspended = False
                 self.on_event("锁定已恢复检查：屏幕配置回到保存时的状态。")
+            if failed:
+                # 部分图标读不到：如实报出来并按失败累计，绝不静默装作没发生。
+                self.failures += 1
+                note = ("有 %d 个图标的位置读不到（权限或 explorer 忙），"
+                        "这些图标本轮未参与比对。" % failed)
+                if note != self.last_error:
+                    self.last_error = note
+                    self.on_event("锁定检查不完整（连续第 %d 轮）：%s"
+                                  % (self.failures, note))
+                if self.failures >= self.FAIL_LIMIT:
+                    fatal = ("连续 %d 轮都有图标位置读不到（最后一次 %d 个），"
+                             "锁定守护已退出。请以管理员身份运行后重新锁定。"
+                             % (self.failures, failed))
+                    break
+            else:
+                self.failures = 0
+                self.last_error = ""
             if drift:
                 self.locked += 1
                 sample = "，".join("%s %s→%s" % (n, a, b) for n, a, b in drift[:3])
@@ -1782,6 +1925,11 @@ class LockWorker(threading.Thread):
                 self.on_event("锁定运行中：已检查 %d 次，共拉回 %d 次，当前正常。"
                               % (self.checks, self.locked))
 
+        # 归还锁定路径专用的句柄与远端缓冲区
+        #（替身 backend 可能没有这个方法，比如自检里的 BadBackend）
+        drop = getattr(self.backend, "drop_cached_views", None)
+        if drop:
+            drop()
         self.on_event("锁定已停止（%s）。" % ("异常退出" if fatal else "正常结束"))
         if fatal and self.on_fatal:
             self.on_fatal(fatal)
@@ -1792,11 +1940,53 @@ class LockWorker(threading.Thread):
 # ---------------------------------------------------------------------------
 # 布局仓库
 # ---------------------------------------------------------------------------
+def validate_import_payload(incoming) -> None:
+    """导入前的轻量结构校验：不合格整批拒绝。
+
+    坏数据一旦进库，要到某次恢复/锁定时才在深处炸出来，那时用户已经忘了
+    是哪次导入带进来的。这里把关口提到导入这一步，报错带条目序号。
+    """
+    if not isinstance(incoming, list):
+        raise ValueError("不是本程序导出的布局文件（缺少 profiles 列表）。")
+    for i, p in enumerate(incoming):
+        if not isinstance(p, dict) or not isinstance(p.get("layout"), dict):
+            raise ValueError("第 %d 条不是有效的布局记录（缺 layout）。" % (i + 1))
+        views = p["layout"].get("views")
+        if views is None:
+            continue          # 极老的快照可能没有 views：交回兼容路径处理
+        if not isinstance(views, list):
+            raise ValueError("第 %d 条的 layout.views 不是列表。" % (i + 1))
+        for j, v in enumerate(views):
+            if not isinstance(v, dict):
+                raise ValueError("第 %d 条第 %d 个视图不是对象。" % (i + 1, j + 1))
+            items = v.get("items")
+            if items is None:
+                continue
+            if not isinstance(items, list):
+                raise ValueError("第 %d 条第 %d 个视图的 items 不是列表。"
+                                 % (i + 1, j + 1))
+            for k, it in enumerate(items):
+                if not isinstance(it, dict):
+                    raise ValueError("第 %d 条第 %d 个视图第 %d 个图标不是对象。"
+                                     % (i + 1, j + 1, k + 1))
+                if not isinstance(it.get("name", ""), str):
+                    raise ValueError("第 %d 条第 %d 个视图第 %d 个图标的 name "
+                                     "不是字符串。" % (i + 1, j + 1, k + 1))
+                for axis in ("x", "y"):
+                    val = it.get(axis)
+                    if val is not None and not isinstance(val, (int, float)):
+                        raise ValueError("第 %d 条第 %d 个视图第 %d 个图标的 %s "
+                                         "不是数字（null 表示当时没读到位置）。"
+                                         % (i + 1, j + 1, k + 1, axis))
+
+
 class ProfileStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.lock = threading.RLock()
         self.data = {"version": 1, "config": dict(DEFAULT_CONFIG), "profiles": []}
+        self.corrupt_backup = None   # layouts.json 损坏被挪走后的备份路径（GUI 会报出来）
+        self.load_error = ""
         self.load()
 
     # ---- IO ----
@@ -1814,17 +2004,25 @@ class ProfileStore:
                 self.data["config"] = cfg
                 profs = raw.get("profiles")
                 self.data["profiles"] = profs if isinstance(profs, list) else []
-            except Exception:
+            except Exception as e:
+                # 原件挪去 .corrupt.json 留底，但不能装作什么都没发生：
+                # GUI 启动时会看 corrupt_backup / load_error 把这事报出来。
+                self.load_error = str(e) or e.__class__.__name__
+                backup = self.path.with_suffix(".corrupt.json")
                 try:
-                    self.path.replace(self.path.with_suffix(".corrupt.json"))
+                    self.path.replace(backup)
+                    self.corrupt_backup = str(backup)
                 except Exception:
-                    pass
+                    self.corrupt_backup = None
 
     def save(self) -> None:
         with self.lock:
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(self.data, ensure_ascii=False, indent=2))
+                # 断电时保证 tmp 的内容真落了盘，os.replace 换过去才是完整的
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, self.path)
 
     # ---- 配置 ----
@@ -1871,10 +2069,11 @@ class ProfileStore:
         return prof
 
     def rename(self, pid: str, name: str) -> bool:
-        p = self.get(pid)
-        if not p:
-            return False
-        p["name"] = name
+        with self.lock:
+            p = self.get(pid)
+            if not p:
+                return False
+            p["name"] = name
         self.save()
         return True
 
@@ -1899,17 +2098,18 @@ class ProfileStore:
         return len(drop)
 
     def export_to(self, path: Path) -> None:
-        Path(path).write_text(json.dumps(self.data, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
+        # 快照一份再写盘：导出途中布局列表被别的线程改掉会写出半截状态
+        with self.lock:
+            payload = json.dumps(self.data, ensure_ascii=False, indent=2)
+        Path(path).write_text(payload, encoding="utf-8")
 
     def import_from(self, path: Path) -> int:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         incoming = raw.get("profiles") if isinstance(raw, dict) else raw
-        if not isinstance(incoming, list):
-            raise ValueError("不是本程序导出的布局文件")
-        existing = {p.get("name") for p in self.profiles}
+        validate_import_payload(incoming)
         added = 0
         with self.lock:
+            existing = {p.get("name") for p in self.data["profiles"]}
             for p in incoming:
                 if not isinstance(p, dict) or "layout" not in p:
                     continue
@@ -2353,6 +2553,7 @@ def main() -> int:
             self.tray_allowed = True      # 关窗提示里选过「否」就不再建（本次运行内）
             self.in_tray = False          # 窗口现在是不是收在托盘里
             self.tray_error = ""
+            self._busy = False            # 后台有跨进程重活在跑（防重入）
 
             self.title("%s  %s" % (APP_TITLE, version_text()))
             self.geometry("1060x900")
@@ -2366,6 +2567,14 @@ def main() -> int:
             self.protocol("WM_DELETE_WINDOW", self.on_close)
             self.log("数据目录：%s" % data_dir())
             self.log(self.version_line())
+            corrupt = getattr(self.store, "corrupt_backup", None)
+            load_err = getattr(self.store, "load_error", "")
+            if corrupt:
+                self.log("警告：layouts.json 读取失败%s，原件已备份为 %s。"
+                         "程序现在以空数据启动；可以从那份备份或「导入布局…」找回。"
+                         % ("（%s）" % load_err if load_err else "", corrupt))
+            elif load_err:
+                self.log("警告：layouts.json 读取失败（%s），程序以空数据启动。" % load_err)
             self.after(80, self._tray_pump)
             self.after(400, self._startup_admin_check)
 
@@ -2678,13 +2887,81 @@ def main() -> int:
             if self.lock_worker and self.lock_worker.is_alive():
                 self.lock_worker.interval = max(0.5, interval)
 
+        # ---------------- 后台执行 / 锁定设防 ----------------
+        def _run_busy(self, text: str, work, on_done, on_error=None):
+            """把跨进程重活（快照/恢复/对齐）丢到后台线程。
+
+            一轮恢复是几十到几百次 SendMessageTimeout，每条最坏 3 秒；
+            在 Tk 主线程里跑就会把整个界面吊死。work 在后台线程执行，
+            结果经 after() 回主线程再碰任何控件。跑着的时候忽略新点击。
+            """
+            if self._busy:
+                return
+            self._busy = True
+            self.config(cursor="watch")
+            self.log(text)
+
+            def runner():
+                err = None
+                result = None
+                try:
+                    result = work()
+                except Exception as e:                     # noqa: BLE001
+                    err = e
+                self.after(0, lambda: self._busy_done(err, result, on_done, on_error))
+
+            threading.Thread(target=runner, daemon=True,
+                             name="DLK-GuiWorker").start()
+
+        def _busy_done(self, err, result, on_done, on_error):
+            self._busy = False
+            try:
+                self.config(cursor="")
+            except Exception:
+                pass
+            if err is not None:
+                if on_error:
+                    on_error(err)
+                else:
+                    messagebox.showerror("操作失败", lock_error_hint(err), parent=self)
+                    self.log("操作失败：%s" % lock_error_hint(err).replace("\n", " "))
+                return
+            on_done(result)
+
+        def _lock_running(self) -> bool:
+            return self.lock_worker is not None and self.lock_worker.is_alive()
+
+        def _guard_lock_busy(self, action: str) -> bool:
+            """锁定开着时，恢复/对齐这类会写桌面的操作先解除锁定。
+
+            锁定线程每 2 秒可能在纠偏还原，此时再写一次坐标就是两个写者
+            交叉操作同一个 ListView——恢复 B 刚写完又被 A 拉回来。
+            """
+            if not self._lock_running():
+                return True
+            if not messagebox.askyesno(
+                "锁定运行中",
+                "正在锁定「%s」。\n\n%s会先解除锁定，完成后不会自动重新锁上。"
+                "继续吗？" % (self._lock_name(), action),
+                parent=self,
+            ):
+                return False
+            self.stop_lock()
+            self.log("已解除锁定（为「%s」让路），需要时再点「锁定选中布局」。"
+                     % action.replace("「", "").replace("」", ""))
+            return True
+
         # ---------------- 动作 ----------------
         def on_save(self):
-            try:
-                layout = self.backend.snapshot()
-            except Exception as e:
-                messagebox.showerror("读取桌面失败", str(e), parent=self)
-                return
+            # 快照是几十到几百次跨进程读取，丢后台跑，主线程只管问名字
+            self._run_busy("正在读取当前桌面布局…", self.backend.snapshot,
+                           self._after_snapshot, on_error=self._snapshot_error)
+
+        def _snapshot_error(self, e):
+            messagebox.showerror("读取桌面失败", str(e), parent=self)
+            self.log("读取桌面失败：%s" % str(e).replace("\n", " "))
+
+        def _after_snapshot(self, layout):
             total = sum(len(v.get("items") or []) for v in layout["views"])
             if total == 0:
                 messagebox.showwarning(
@@ -2715,29 +2992,34 @@ def main() -> int:
                 "确认", "这是一条自动备份，确定要恢复到它吗？", parent=self
             ):
                 return
-
-            if self.var_auto_backup.get():
-                try:
-                    snap = self.backend.snapshot()
-                    self.store.add("恢复前备份", snap, auto_backup=True)
-                    dropped = self.store.prune_auto_backups(
-                        int(self.store.config.get("auto_backup_keep", 8)))
-                    self.refresh_profiles()
-                    self.log("已自动备份当前布局%s。"
-                             % ("，清理旧备份 %d 条" % dropped if dropped else ""))
-                except Exception as e:
-                    self.log("自动备份失败（已忽略）：%s" % e)
-
-            try:
-                stats = self.backend.restore(
-                    prof,
-                    disable_auto_arrange=self.var_disable_aa.get(),
-                    index_fallback=self.var_index_fb.get(),
-                )
-            except Exception as e:
-                messagebox.showerror("恢复失败", lock_error_hint(e), parent=self)
-                self.log("恢复失败：%s" % lock_error_hint(e).replace("\n", " "))
+            if not self._guard_lock_busy("恢复布局"):
                 return
+            do_backup = bool(self.var_auto_backup.get())
+            disable_aa = bool(self.var_disable_aa.get())
+            index_fb = bool(self.var_index_fb.get())
+
+            def work():
+                note = ""
+                if do_backup:
+                    try:
+                        snap = self.backend.snapshot()
+                        self.store.add("恢复前备份", snap, auto_backup=True)
+                        dropped = self.store.prune_auto_backups(
+                            int(self.store.config.get("auto_backup_keep", 8)))
+                        note = ("已自动备份当前布局%s。"
+                                % ("，清理旧备份 %d 条" % dropped if dropped else ""))
+                    except Exception as e:                     # noqa: BLE001
+                        note = "自动备份失败（已忽略）：%s" % e
+                stats = self.backend.restore(prof, disable_aa, index_fb)
+                return note, stats
+
+            self._run_busy("正在恢复布局…", work, self._after_restore)
+
+        def _after_restore(self, result):
+            note, stats = result
+            if note:
+                self.log(note)
+            self.refresh_profiles()
 
             msg = ("已恢复 %d 个图标（%d 个视图）。\n复核结果：精确落位 %d 个"
                    "，吸附到格点 %d 个，按屏幕适配 %d 个，偏差 %d 个。" % (
@@ -2768,6 +3050,9 @@ def main() -> int:
                         + "\n    · ".join(stats["appearance"])
                         + "\n    → 改法：桌面右键 → 查看 → 选图标大小；"
                           "排序方式也在右键菜单里。")
+            if stats.get("failed_reads"):
+                msg += ("\n\n注意：有 %d 个图标的位置没读到（权限不够或 explorer 忙），"
+                        "这些图标本轮未参与比对。" % stats["failed_reads"])
             if stats.get("note"):
                 msg += "\n\n注意：%s" % stats["note"]
 
@@ -2775,11 +3060,12 @@ def main() -> int:
             messagebox.showinfo("恢复完成", msg, parent=self)
 
         def on_grid_snap(self):
-            try:
-                n = self.backend.apply_grid_snap()
-            except Exception as e:
-                messagebox.showerror("对齐失败", str(e), parent=self)
+            if not self._guard_lock_busy("对齐网格"):
                 return
+            self._run_busy("正在把图标对齐到网格…", self.backend.apply_grid_snap,
+                           self._after_grid_snap)
+
+        def _after_grid_snap(self, n):
             self.log("已把 %d 个图标对齐到网格（顺序未改变）。" % n)
             messagebox.showinfo("完成", "已把 %d 个图标对齐到网格。\n\n建议现在保存一套布局。"
                                 % n, parent=self)
@@ -2858,22 +3144,32 @@ def main() -> int:
             self._tray_update_tip()
 
         def on_toggle_lock(self):
-            if self.lock_worker is not None and self.lock_worker.is_alive():
+            if self._lock_running():
                 self.stop_lock()
                 return
             prof = self._selected_profile()
             if not prof:
                 messagebox.showinfo("提示", "请先选中要锁定的布局。", parent=self)
                 return
-            try:
-                self.backend.restore(
-                    prof,
-                    disable_auto_arrange=self.var_disable_aa.get(),
-                    index_fallback=self.var_index_fb.get(),
-                )
-            except Exception as e:
+            disable_aa = bool(self.var_disable_aa.get())
+            index_fb = bool(self.var_index_fb.get())
+
+            def work():
+                # 锁定前先把图标按选中布局摆到位——这也是一轮跨进程写，丢后台跑
+                self.backend.restore(prof, disable_aa, index_fb)
+
+            def done(_result):
+                self._start_lock_worker(prof)
+
+            def on_error(e):
                 messagebox.showerror("锁定失败", lock_error_hint(e), parent=self)
                 self.log("锁定失败：%s" % lock_error_hint(e).replace("\n", " "))
+
+            self._run_busy("正在按「%s」摆好图标…" % prof.get("name", "?"),
+                           work, done, on_error)
+
+        def _start_lock_worker(self, prof):
+            if self._lock_running():
                 return
             self.lock_worker = LockWorker(
                 self.backend, prof,
@@ -2939,6 +3235,9 @@ def main() -> int:
         def on_relaunch_admin(self):
             if is_admin():
                 messagebox.showinfo("提示", "当前已经是管理员模式了。", parent=self)
+                return
+            if self._busy:
+                self.after(200, self.on_relaunch_admin)   # 等后台的跨进程活落定
                 return
             if not messagebox.askyesno(
                 "以管理员身份重启",
@@ -3073,6 +3372,11 @@ def main() -> int:
             规矩（用户定的）：**只有在锁定开着的时候**才问要不要缩到托盘；
             答「否」就不再做托盘常驻（本次运行内），程序直接退出、锁定随之解除。
             """
+            if self._busy:
+                # 后台还有跨进程重活（多半是锁定前的摆位）。现在退会把写坐标的
+                # 线程一起带走；等它落定（200ms 后再问一次）再走正常关窗流程。
+                self.after(200, self.on_close)
+                return
             running = self.lock_worker is not None and self.lock_worker.is_alive()
             if running and not self.in_tray and self.tray_allowed and IS_WINDOWS:
                 ans = messagebox.askyesnocancel(
@@ -3158,8 +3462,24 @@ def main() -> int:
             app.tree.selection_set(kids[0])
             app.tree.focus(kids[0])
             app.on_toggle_lock()
-            res["lock_started"] = bool(app.lock_worker and app.lock_worker.is_alive())
-            app.after(2500, _st2)
+
+            # 恢复与起线程现在是后台异步完成（界面线程不再被跨进程写卡住）：
+            # 轮询等锁定线程真的起来再记录，最多等 6 秒；起不来就如实记 False。
+            tries = [60]
+
+            def _wait_lock():
+                if app.lock_worker and app.lock_worker.is_alive():
+                    res["lock_started"] = True
+                    app.after(2500, _st2)
+                    return
+                if tries[0] <= 0:
+                    res["lock_started"] = False
+                    app.after(2500, _st2)
+                    return
+                tries[0] -= 1
+                app.after(100, _wait_lock)
+
+            _wait_lock()
 
         def _st2():
             messagebox.askyesnocancel = lambda *a, **k: (

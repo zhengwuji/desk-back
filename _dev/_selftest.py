@@ -125,8 +125,8 @@ try:
     m.refresh_view(vv.hwnd)
     k.close_views(vs)
 
-    drift = k.enforce(profile, True, True)
-    print("enforce 检测到漂移 %d 处: %s" % (len(drift), drift[:2]))
+    drift, unread = k.enforce(profile, True, True)
+    print("enforce 检测到漂移 %d 处（没读到位置 %d 个）: %s" % (len(drift), unread, drift[:2]))
     assert drift, "enforce 没有检测到漂移"
 
     aa4, snap4, sig_back = current_state()
@@ -135,8 +135,8 @@ try:
     print("== 锁定纠偏：%s 已拉回，布局恢复一致（坐标系偏移 %s）==" % (victim["name"], off4))
 
     # 再跑一次必须零漂移：证明纠偏收敛，不会反复刷桌面
-    drift2 = k.enforce(profile, True, True)
-    print("第二次 enforce 漂移数:", len(drift2))
+    drift2, unread2 = k.enforce(profile, True, True)
+    print("第二次 enforce 漂移数:", len(drift2), "（没读到位置 %d 个）" % unread2)
     assert not drift2, "纠偏不收敛，第二次仍报漂移: %s" % drift2[:3]
     print("== 纠偏收敛（第二次零漂移）==")
 
